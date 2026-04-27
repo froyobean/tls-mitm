@@ -58,6 +58,46 @@ func TestParseArgsRejectsBadIP(t *testing.T) {
 	}
 }
 
+func TestParseArgsDefaultsMutateDirectionToOut(t *testing.T) {
+	cfg, err := ParseArgs([]string{"-target-ip", "93.184.216.34", "-target-port", "443"})
+	if err != nil {
+		t.Fatalf("ParseArgs returned error: %v", err)
+	}
+	if cfg.MutateDirection != "out" {
+		t.Fatalf("expected mutate direction out, got %q", cfg.MutateDirection)
+	}
+}
+
+func TestParseArgsNormalizesEmptyMutateDirectionToOut(t *testing.T) {
+	cfg, err := ParseArgs([]string{"-target-ip", "93.184.216.34", "-target-port", "443", "-mutate-direction", ""})
+	if err != nil {
+		t.Fatalf("ParseArgs returned error: %v", err)
+	}
+	if cfg.MutateDirection != "out" {
+		t.Fatalf("expected mutate direction out, got %q", cfg.MutateDirection)
+	}
+}
+
+func TestParseArgsAcceptsInAndBothMutateDirection(t *testing.T) {
+	for _, mutateDirection := range []string{"in", "both"} {
+		t.Run(mutateDirection, func(t *testing.T) {
+			cfg, err := ParseArgs([]string{"-target-ip", "93.184.216.34", "-target-port", "443", "-mutate-direction", mutateDirection})
+			if err != nil {
+				t.Fatalf("ParseArgs returned error: %v", err)
+			}
+			if cfg.MutateDirection != mutateDirection {
+				t.Fatalf("expected mutate direction %q, got %q", mutateDirection, cfg.MutateDirection)
+			}
+		})
+	}
+}
+
+func TestParseArgsRejectsInvalidMutateDirection(t *testing.T) {
+	if _, err := ParseArgs([]string{"-target-ip", "93.184.216.34", "-target-port", "443", "-mutate-direction", "sideways"}); err == nil || !strings.Contains(err.Error(), "mutate-direction") {
+		t.Fatalf("expected mutate-direction error, got %v", err)
+	}
+}
+
 func TestParseArgsHelp(t *testing.T) {
 	if _, err := ParseArgs([]string{"-h"}); !errors.Is(err, ErrHelpRequested) {
 		t.Fatalf("expected ErrHelpRequested, got %v", err)
@@ -66,7 +106,29 @@ func TestParseArgsHelp(t *testing.T) {
 
 func TestUsageIncludesFlags(t *testing.T) {
 	usage := Usage()
-	for _, want := range []string{"-h", "-target-ip", "-target-host", "-target-port", "-observe-timeout", "-log-format", "-mutate-offset", "-unsafe-any-host"} {
+	for _, want := range []string{"-h", "-target-ip", "-target-host", "-target-port", "-observe-timeout", "-log-format", "-mutate-offset", "-mutate-direction", "-unsafe-any-host"} {
+		if !strings.Contains(usage, want) {
+			t.Fatalf("usage missing %q: %s", want, usage)
+		}
+	}
+}
+
+func TestUsageMentionsMutateDirection(t *testing.T) {
+	usage := Usage()
+	for _, want := range []string{"-mutate-direction <方向>", "out、in 或 both"} {
+		if !strings.Contains(usage, want) {
+			t.Fatalf("usage missing %q: %s", want, usage)
+		}
+	}
+}
+
+func TestUsageIncludesMutateDirectionExamples(t *testing.T) {
+	usage := Usage()
+	for _, want := range []string{
+		"tls-mitm -target-ip 93.184.216.34 -target-port 443 -mutate-direction out",
+		"tls-mitm -target-host example.com -target-port 443 -mutate-direction in",
+		"tls-mitm -target-host example.com -target-port 443 -mutate-direction both",
+	} {
 		if !strings.Contains(usage, want) {
 			t.Fatalf("usage missing %q: %s", want, usage)
 		}
@@ -99,6 +161,7 @@ func TestUsageKeepsFlagOrder(t *testing.T) {
 	observeTimeoutIndex := strings.Index(usage, "-observe-timeout")
 	logFormatIndex := strings.Index(usage, "-log-format")
 	mutateOffsetIndex := strings.Index(usage, "-mutate-offset")
+	mutateDirectionIndex := strings.Index(usage, "-mutate-direction")
 	unsafeAnyHostIndex := strings.Index(usage, "-unsafe-any-host")
 	helpIndex := strings.Index(usage, "-h, -help")
 	if !(targetPortIndex < targetIPIndex &&
@@ -106,7 +169,8 @@ func TestUsageKeepsFlagOrder(t *testing.T) {
 		targetHostIndex < observeTimeoutIndex &&
 		observeTimeoutIndex < logFormatIndex &&
 		logFormatIndex < mutateOffsetIndex &&
-		mutateOffsetIndex < unsafeAnyHostIndex &&
+		mutateOffsetIndex < mutateDirectionIndex &&
+		mutateDirectionIndex < unsafeAnyHostIndex &&
 		unsafeAnyHostIndex < helpIndex) {
 		t.Fatalf("unexpected usage order: %s", usage)
 	}

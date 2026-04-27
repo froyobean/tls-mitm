@@ -4,3 +4,5 @@
 bin/
 build/
 *.test.exe
+.idea/
+.codex/

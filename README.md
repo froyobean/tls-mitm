@@ -1,5 +1,15 @@
 # tls-mitm
 
+`tls-mitm` 是一个 Windows 专用的 TLS 密文篡改实验工具。
+
+当前实现基于 `github.com/imgk/divert-go` 和 WinDivert，目标是：
+
+- 按目标 IP、SNI 域名和端口选择连接
+- 在命中的 TLS `Application Data record` 上生成破坏点
+- 对命中 record 的首发包或重传包施加相同篡改
+- 重注入修改后的数据包
+- 继续观察对端是否出现 `RST`、`FIN`、疑似 `TLS alert` 或超时
+
 ## 最新说明
 
 当前版本支持以下四种目标选择模式：
@@ -18,62 +28,99 @@
 - `-target-port` 必填。
 - 默认情况下，`-target-ip` 与 `-target-host` 至少提供一个，可以同时提供。
 - 若未提供 `-target-ip` 和 `-target-host`，则必须显式添加 `-unsafe-any-host` 才允许启动。
-- 当前篡改单位是“每条经出站最小 TCP 重组后确认完整的 TLS `Application Data record`”。
+- 当前篡改单位是“每条经最小 TCP 重组后确认完整的 TLS `Application Data record`”。
 - 每条完整 `record` 只生成一个破坏点，破坏点由 `-mutate-offset` 决定。
 - 任意覆盖该破坏点的首次发送或重传 TCP 包都会施加同样篡改。
 - 当 `record` 数据长度不足以覆盖 `-mutate-offset` 时，会保守跳过该 `record`，不会让主循环退出。
 - 无法确认完整 `record` 边界时，保守放行。
 - 不做 TLS 解密。
 - 当拿不到 `SNI` 时，`host-only` 模式会保守放行，不会猜测命中。
+- `host-only` 模式下，同一条已命中连接会持续保留专用阻断句柄，后续多轮 `Application Data record` 仍会继续进入篡改链路。
+- `host-only` 模式下，单轮观察结束只重置本轮观察状态；只有连接真实结束或半关闭静默兜底回收到期时，才释放该连接的阻断句柄和状态。
 
-### 最新运行示例
+## `-mutate-direction` 说明
 
-仅按 IP 匹配：
+`-mutate-direction` 用来指定实际施加密文篡改的方向，支持三个值：
+
+- `out`
+  只篡改出站方向。命中后的结果观察仍然会同时结合入站信号。
+- `in`
+  只篡改入站方向。直连模式下会阻断并重注入入站包；`target-host` 模式下会在 `SNI` 命中后才为该连接创建专用入站 blocker。
+- `both`
+  双向都允许篡改。`target-host` 模式下会在命中后创建单个双向 blocker。
+
+`target-host` 模式下的句柄编排如下：
+
+- `out`
+  始终先用 outbound `sniff` 句柄识别 `ClientHello/SNI`，命中后只创建 outbound blocker。
+- `in`
+  始终先用 outbound `sniff` 句柄识别 `ClientHello/SNI`，命中后只创建 inbound blocker。
+- `both`
+  始终先用 outbound `sniff` 句柄识别 `ClientHello/SNI`，命中后创建 bidirectional blocker。
+
+非目标连接在 `target-host` 模式下始终只观察、不阻断。
+
+## `target-host` 持续连接说明
+
+仅提供 `-target-host` 时，工具无法在打开主阻断句柄前用固定 IP 收窄范围，因此会先用 outbound `sniff` 句柄观察目标端口上的 `ClientHello/SNI`。当某条 TCP 连接的 `SNI` 命中目标域名后，工具会为该连接四元组创建专用阻断句柄。
+
+专用阻断句柄的生命周期按“连接”而不是按“观察轮次”管理：
+
+- 每条完整 `Application Data record` 仍然只生成一个破坏点。
+- 一轮篡改后的观察结果输出后，该连接会继续保留命中状态、`trace_id` 和专用阻断句柄。
+- 如果同一 TCP 连接后续继续发送或接收新的 `Application Data record`，会继续按 `-mutate-direction` 进入篡改链路。
+- 收到 `RST` 或观察到双向 `FIN` 后，会按连接结束释放该连接状态。
+- 普通长空闲连接不会仅因观察窗口结束而释放，后续同一连接的 `Application Data record` 仍会继续被篡改。
+- 如果只观察到单边 `FIN` 后另一端长期没有结束连接，会通过半关闭静默兜底释放状态，避免专用阻断句柄长期驻留。
+
+## 运行示例
+
+仅按 IP 匹配，默认只改出站：
 
 ```powershell
-.\build\tls-mitm.exe -target-ip 93.184.216.34 -target-port 443 -observe-timeout 5s -mutate-offset 0
+.\build\tls-mitm.exe -target-ip 93.184.216.34 -target-port 443 -observe-timeout 5s -mutate-offset 0 -mutate-direction out
 ```
 
-仅按域名匹配：
+仅按 IP 匹配，只改入站：
 
 ```powershell
-.\build\tls-mitm.exe -target-host example.com -target-port 443 -observe-timeout 5s -mutate-offset 0
+.\build\tls-mitm.exe -target-ip 93.184.216.34 -target-port 443 -observe-timeout 5s -mutate-offset 0 -mutate-direction in
 ```
 
-按 `IP + 域名` 交集匹配：
+仅按域名匹配，只改入站：
 
 ```powershell
-.\build\tls-mitm.exe -target-ip 93.184.216.34 -target-host example.com -target-port 443 -observe-timeout 5s -mutate-offset 0
+.\build\tls-mitm.exe -target-host example.com -target-port 443 -observe-timeout 5s -mutate-offset 0 -mutate-direction in
+```
+
+仅按域名匹配，双向都改：
+
+```powershell
+.\build\tls-mitm.exe -target-host example.com -target-port 443 -observe-timeout 5s -mutate-offset 0 -mutate-direction both
+```
+
+按 `IP + 域名` 交集匹配，双向都改：
+
+```powershell
+.\build\tls-mitm.exe -target-ip 93.184.216.34 -target-host example.com -target-port 443 -observe-timeout 5s -mutate-offset 0 -mutate-direction both
 ```
 
 显式启用危险的“按端口匹配所有主机”模式：
 
 ```powershell
-.\build\tls-mitm.exe -target-port 443 -unsafe-any-host -observe-timeout 5s -mutate-offset 0
+.\build\tls-mitm.exe -target-port 443 -unsafe-any-host -observe-timeout 5s -mutate-offset 0 -mutate-direction out
 ```
 
-### 最新参数说明
+## 参数说明
 
 - `-target-ip`：按目标服务器 IP 匹配，可选
 - `-target-host`：按 TLS `SNI` 域名匹配，可选
 - `-target-port`：目标服务器端口，必填
 - `-observe-timeout`：篡改后的观察窗口
 - `-mutate-offset`：决定命中的 `Application Data record` 在密文区内哪个偏移生成破坏点；若 `record` 太短则保守跳过
+- `-mutate-direction`：控制实际执行篡改的方向，支持 `out`、`in`、`both`
 - `-log-format`：日志格式，支持文本和 JSON
 - `-unsafe-any-host`：显式允许按 `target-port` 匹配所有主机，属于高风险实验开关
-
-下面保留的是前面的构建与运行说明；如果和本节冲突，以“最新说明”为准。
-
-`tls-mitm` 是一个 Windows 专用的 TLS 密文篡改实验工具。
-
-当前实现基于 `github.com/imgk/divert-go` 和 WinDivert，目标是：
-
-- 按 `目标 IP:端口` 捕获出站 TCP/TLS 流量
-- 按经出站最小 TCP 重组确认完整的 `Application Data record` 生成破坏点
-- 每条完整 `record` 只生成一个破坏点，位置由 `-mutate-offset` 决定，并在首次发送或重传时保持同样篡改
-- 若完整 `record` 的数据长度不足以覆盖 `-mutate-offset`，则保守跳过该 `record`
-- 重注入修改后的数据包
-- 继续观察对端是否出现 `RST`、`FIN`、疑似 `TLS alert` 或超时
 
 ## 推荐构建方式
 
@@ -175,20 +222,6 @@ make test GO=/mingw64/bin/go.exe
 ```
 
 这个 `Makefile` 不依赖 PowerShell，内部直接调用 `go build` 和 `go test`。
-
-## 运行示例
-
-```powershell
-.\build\tls-mitm.exe -target-ip 93.184.216.34 -target-port 443 -observe-timeout 5s -mutate-offset 0
-```
-
-参数说明：
-
-- `-target-ip`：目标服务器 IP
-- `-target-port`：目标服务器端口
-- `-observe-timeout`：篡改后观察窗口
-- `-mutate-offset`：决定命中的 record 在密文区内哪个偏移生成破坏点；若 record 太短则保守跳过
-- `-log-format`：日志格式，支持文本和 JSON
 
 ## 当前验证范围
 

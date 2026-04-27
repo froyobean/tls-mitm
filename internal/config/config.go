@@ -14,13 +14,14 @@ import (
 
 // Config 描述程序运行所需的配置。
 type Config struct {
-	TargetIP       netip.Addr
-	TargetHost     string
-	TargetPort     uint16
-	ObserveTimeout time.Duration
-	LogFormat      string
-	MutateOffset   int
-	UnsafeAnyHost  bool
+	TargetIP        netip.Addr
+	TargetHost      string
+	TargetPort      uint16
+	ObserveTimeout  time.Duration
+	LogFormat       string
+	MutateOffset    int
+	MutateDirection string
+	UnsafeAnyHost   bool
 }
 
 // ErrHelpRequested 表示用户请求输出帮助信息。
@@ -30,7 +31,7 @@ var ErrHelpRequested = errors.New("help requested")
 func ParseArgs(args []string) (Config, error) {
 	fs := newFlagSet(io.Discard)
 
-	targetIP, targetHost, targetPort, observeTimeout, logFormat, mutateOffset, unsafeAnyHost, showHelp := bindFlags(fs)
+	targetIP, targetHost, targetPort, observeTimeout, logFormat, mutateOffset, mutateDirection, unsafeAnyHost, showHelp := bindFlags(fs)
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -44,12 +45,19 @@ func ParseArgs(args []string) (Config, error) {
 
 	normalizedTargetIP := strings.TrimSpace(*targetIP)
 	normalizedTargetHost := normalizeTargetHost(*targetHost)
+	normalizedMutateDirection := normalizeMutateDirection(*mutateDirection)
 
 	if normalizedTargetIP == "" && normalizedTargetHost == "" && !*unsafeAnyHost {
 		return Config{}, errors.New("至少需要提供 target-ip 或 target-host；如果要按端口匹配所有主机，请显式添加 -unsafe-any-host")
 	}
 	if *targetPort <= 0 || *targetPort > 65535 {
 		return Config{}, fmt.Errorf("无效的目标端口: %d", *targetPort)
+	}
+	if normalizedMutateDirection == "" {
+		normalizedMutateDirection = "out"
+	}
+	if normalizedMutateDirection != "out" && normalizedMutateDirection != "in" && normalizedMutateDirection != "both" {
+		return Config{}, fmt.Errorf("无效的 -mutate-direction: %s（仅支持 out、in 或 both）", normalizedMutateDirection)
 	}
 
 	var addr netip.Addr
@@ -65,13 +73,14 @@ func ParseArgs(args []string) (Config, error) {
 	}
 
 	return Config{
-		TargetIP:       addr,
-		TargetHost:     normalizedTargetHost,
-		TargetPort:     uint16(*targetPort),
-		ObserveTimeout: *observeTimeout,
-		LogFormat:      *logFormat,
-		MutateOffset:   *mutateOffset,
-		UnsafeAnyHost:  *unsafeAnyHost,
+		TargetIP:        addr,
+		TargetHost:      normalizedTargetHost,
+		TargetPort:      uint16(*targetPort),
+		ObserveTimeout:  *observeTimeout,
+		LogFormat:       *logFormat,
+		MutateOffset:    *mutateOffset,
+		MutateDirection: normalizedMutateDirection,
+		UnsafeAnyHost:   *unsafeAnyHost,
 	}, nil
 }
 
@@ -91,6 +100,7 @@ func Usage() string {
 		{name: "-observe-timeout <时长>", description: "篡改后的观察窗口", defaultValue: "5s"},
 		{name: "-log-format <格式>", description: "日志格式，可选 text 或 json", defaultValue: "text"},
 		{name: "-mutate-offset <偏移>", description: "命中 record 后要翻转的密文字节偏移", defaultValue: "0"},
+		{name: "-mutate-direction <方向>", description: "篡改方向：out、in 或 both", defaultValue: "out"},
 		{name: "-unsafe-any-host", description: "显式允许按目标端口匹配所有主机"},
 		{name: "-h, -help", description: "显示帮助信息"},
 	})
@@ -98,6 +108,9 @@ func Usage() string {
 	builder.WriteString("  tls-mitm -target-ip 93.184.216.34 -target-port 443\n")
 	builder.WriteString("  tls-mitm -target-host example.com -target-port 443\n")
 	builder.WriteString("  tls-mitm -target-ip 93.184.216.34 -target-host example.com -target-port 443\n")
+	builder.WriteString("  tls-mitm -target-ip 93.184.216.34 -target-port 443 -mutate-direction out\n")
+	builder.WriteString("  tls-mitm -target-host example.com -target-port 443 -mutate-direction in\n")
+	builder.WriteString("  tls-mitm -target-host example.com -target-port 443 -mutate-direction both\n")
 	builder.WriteString("  tls-mitm -target-port 443 -unsafe-any-host\n")
 	builder.WriteString("\n约束:\n")
 	builder.WriteString("  -target-ip 与 -target-host 至少提供一个，可以同时提供。\n")
@@ -111,21 +124,26 @@ func newFlagSet(output io.Writer) *flag.FlagSet {
 	return fs
 }
 
-func bindFlags(fs *flag.FlagSet) (*string, *string, *int, *time.Duration, *string, *int, *bool, *bool) {
+func bindFlags(fs *flag.FlagSet) (*string, *string, *int, *time.Duration, *string, *int, *string, *bool, *bool) {
 	targetIP := fs.String("target-ip", "", "目标 IP")
 	targetHost := fs.String("target-host", "", "目标域名")
 	targetPort := fs.Int("target-port", 0, "目标端口")
 	observeTimeout := fs.Duration("observe-timeout", 5*time.Second, "观察超时")
 	logFormat := fs.String("log-format", "text", "日志格式")
 	mutateOffset := fs.Int("mutate-offset", 0, "篡改偏移")
+	mutateDirection := fs.String("mutate-direction", "out", "篡改方向：out、in 或 both")
 	unsafeAnyHost := fs.Bool("unsafe-any-host", false, "显式允许按目标端口匹配所有主机")
 	showHelp := fs.Bool("h", false, "显示帮助信息")
 	fs.BoolVar(showHelp, "help", false, "显示帮助信息")
-	return targetIP, targetHost, targetPort, observeTimeout, logFormat, mutateOffset, unsafeAnyHost, showHelp
+	return targetIP, targetHost, targetPort, observeTimeout, logFormat, mutateOffset, mutateDirection, unsafeAnyHost, showHelp
 }
 
 func normalizeTargetHost(targetHost string) string {
 	return strings.ToLower(strings.TrimSpace(targetHost))
+}
+
+func normalizeMutateDirection(mutateDirection string) string {
+	return strings.ToLower(strings.TrimSpace(mutateDirection))
 }
 
 type usageItem struct {

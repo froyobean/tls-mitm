@@ -67,16 +67,21 @@ type Store struct {
 }
 
 type entry struct {
-	traceID       string
-	mutatedAt     time.Time
-	observeFor    time.Duration
-	byteIndex     int
-	matchState    MatchState
-	hasMutation   bool
-	lastObserved  time.Time
-	done          bool
-	outcome       Outcome
-	frozen        Result
+	traceID      string
+	mutatedAt    time.Time
+	observeFor   time.Duration
+	byteIndex    int
+	matchState   MatchState
+	hasMutation  bool
+	lastObserved time.Time
+	done         bool
+	outcome      Outcome
+	frozen       Result
+	outbound     directionState
+	inbound      directionState
+}
+
+type directionState struct {
 	reassembly    *reassembly.State
 	pendingPoints []reassembly.MutationPoint
 	lastAck       uint32
@@ -131,17 +136,28 @@ func (s *Store) HasMutation(key Key) bool {
 	return e.hasMutation
 }
 
-// Reassembly 返回连接对应的出站重组状态，不存在时按初始序号创建。
-// 调用方应串行使用返回的内部可变状态。
-func (s *Store) Reassembly(key Key, initialSeq uint32) *reassembly.State {
+// OutboundReassembly 返回出站方向对应的重组状态。
+func (s *Store) OutboundReassembly(key Key, initialSeq uint32) *reassembly.State {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	e := s.ensureEntryLocked(key)
-	if e.reassembly == nil {
-		e.reassembly = reassembly.NewState(initialSeq)
-	}
-	return e.reassembly
+	return reassemblyFor(&e.outbound, initialSeq)
+}
+
+// InboundReassembly 返回入站方向对应的重组状态。
+func (s *Store) InboundReassembly(key Key, initialSeq uint32) *reassembly.State {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e := s.ensureEntryLocked(key)
+	return reassemblyFor(&e.inbound, initialSeq)
+}
+
+// Reassembly 返回连接对应的出站重组状态，不存在时按初始序号创建。
+// 调用方应串行使用返回的内部可变状态。
+func (s *Store) Reassembly(key Key, initialSeq uint32) *reassembly.State {
+	return s.OutboundReassembly(key, initialSeq)
 }
 
 // TraceID 返回连接级 trace_id，未知连接返回空字符串。
@@ -156,35 +172,60 @@ func (s *Store) TraceID(key Key) string {
 	return e.traceID
 }
 
-// AddMutationPoint 记录一个待确认的篡改点。
-func (s *Store) AddMutationPoint(key Key, point reassembly.MutationPoint) {
+// AddOutboundMutationPoint 记录一个出站方向待确认的篡改点。
+func (s *Store) AddOutboundMutationPoint(key Key, point reassembly.MutationPoint) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	e := s.ensureEntryLocked(key)
-	if e.lastAck > point.TargetSeq {
-		return
-	}
-	e.pendingPoints = append(e.pendingPoints, point)
+	addMutationPoint(&e.outbound, point)
 }
 
-// PendingMutationPoints 返回连接当前尚未被 ACK 覆盖的篡改点副本。
-func (s *Store) PendingMutationPoints(key Key) []reassembly.MutationPoint {
+// AddInboundMutationPoint 记录一个入站方向待确认的篡改点。
+func (s *Store) AddInboundMutationPoint(key Key, point reassembly.MutationPoint) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e := s.ensureEntryLocked(key)
+	addMutationPoint(&e.inbound, point)
+}
+
+// AddMutationPoint 保留给现有调用方使用，语义映射到出站方向。
+func (s *Store) AddMutationPoint(key Key, point reassembly.MutationPoint) {
+	s.AddOutboundMutationPoint(key, point)
+}
+
+// OutboundPendingMutationPoints 返回出站方向当前尚未被 ACK 覆盖的篡改点副本。
+func (s *Store) OutboundPendingMutationPoints(key Key) []reassembly.MutationPoint {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	e, ok := s.data[key]
-	if !ok || len(e.pendingPoints) == 0 {
+	if !ok {
 		return nil
 	}
-
-	points := make([]reassembly.MutationPoint, len(e.pendingPoints))
-	copy(points, e.pendingPoints)
-	return points
+	return pendingMutationPoints(&e.outbound)
 }
 
-// AckUpTo 清理所有已经被 ACK 覆盖的待确认篡改点。
-func (s *Store) AckUpTo(key Key, ack uint32) {
+// InboundPendingMutationPoints 返回入站方向当前尚未被 ACK 覆盖的篡改点副本。
+func (s *Store) InboundPendingMutationPoints(key Key) []reassembly.MutationPoint {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.data[key]
+	if !ok {
+		return nil
+	}
+	return pendingMutationPoints(&e.inbound)
+}
+
+// PendingMutationPoints 保留给现有调用方使用，语义映射到出站方向。
+func (s *Store) PendingMutationPoints(key Key) []reassembly.MutationPoint {
+	return s.OutboundPendingMutationPoints(key)
+}
+
+// AckOutboundUpTo 处理入站包携带的 ACK，清理已经被确认的 outbound pending points.
+func (s *Store) AckOutboundUpTo(key Key, ack uint32) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -192,23 +233,24 @@ func (s *Store) AckUpTo(key Key, ack uint32) {
 	if !ok {
 		return
 	}
-	effectiveAck := e.lastAck
-	if ack > effectiveAck {
-		effectiveAck = ack
-	}
-	e.lastAck = effectiveAck
+	ackUpTo(&e.outbound, ack)
+}
 
-	filtered := e.pendingPoints[:0]
-	for _, point := range e.pendingPoints {
-		if effectiveAck <= point.TargetSeq {
-			filtered = append(filtered, point)
-		}
-	}
-	if len(filtered) == 0 {
-		e.pendingPoints = nil
+// AckInboundUpTo 处理出站包携带的 ACK，清理已经被确认的 inbound pending points.
+func (s *Store) AckInboundUpTo(key Key, ack uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.data[key]
+	if !ok {
 		return
 	}
-	e.pendingPoints = filtered
+	ackUpTo(&e.inbound, ack)
+}
+
+// AckUpTo 保留给现有调用方使用，语义映射到出站方向。
+func (s *Store) AckUpTo(key Key, ack uint32) {
+	s.AckOutboundUpTo(key, ack)
 }
 
 // MarkMatched 将连接标记为已命中目标。
@@ -237,6 +279,19 @@ func (s *Store) Forget(key Key) {
 	delete(s.data, key)
 }
 
+// ResetObservation 结束当前轮次观察，但保留连接级身份与状态（如 traceID、matchState、重组状态等）。
+func (s *Store) ResetObservation(key Key) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.data[key]
+	if !ok {
+		return
+	}
+	resetObservationLocked(e)
+	e.hasMutation = false
+}
+
 // MarkMutated 记录一条连接进入或刷新篡改后观察阶段。
 func (s *Store) MarkMutated(key Key, observe time.Duration, byteIndex int) {
 	_ = s.TryMarkMutated(key, observe, byteIndex)
@@ -249,13 +304,11 @@ func (s *Store) TryMarkMutated(key Key, observe time.Duration, byteIndex int) bo
 
 	e := s.ensureEntryLocked(key)
 	firstMutation := !e.hasMutation
+	resetObservationLocked(e)
 	e.hasMutation = true
 	e.mutatedAt = s.now()
 	e.observeFor = observe
 	e.byteIndex = byteIndex
-	e.done = false
-	e.outcome = OutcomeUnknown
-	e.frozen = Result{}
 	return firstMutation
 }
 
@@ -308,12 +361,66 @@ func (s *Store) ensureEntryLocked(key Key) *entry {
 	return e
 }
 
+func reassemblyFor(state *directionState, initialSeq uint32) *reassembly.State {
+	if state.reassembly == nil {
+		state.reassembly = reassembly.NewState(initialSeq)
+	}
+	return state.reassembly
+}
+
+func addMutationPoint(state *directionState, point reassembly.MutationPoint) {
+	if state.lastAck > point.TargetSeq {
+		return
+	}
+	state.pendingPoints = append(state.pendingPoints, point)
+}
+
+func pendingMutationPoints(state *directionState) []reassembly.MutationPoint {
+	if len(state.pendingPoints) == 0 {
+		return nil
+	}
+
+	points := make([]reassembly.MutationPoint, len(state.pendingPoints))
+	copy(points, state.pendingPoints)
+	return points
+}
+
+func ackUpTo(state *directionState, ack uint32) {
+	effectiveAck := state.lastAck
+	if ack > effectiveAck {
+		effectiveAck = ack
+	}
+	state.lastAck = effectiveAck
+
+	filtered := state.pendingPoints[:0]
+	for _, point := range state.pendingPoints {
+		if effectiveAck <= point.TargetSeq {
+			filtered = append(filtered, point)
+		}
+	}
+	if len(filtered) == 0 {
+		state.pendingPoints = nil
+		return
+	}
+	state.pendingPoints = filtered
+}
+
 func (s *Store) buildResultLocked(e *entry, outcome Outcome, observedFor time.Duration) Result {
 	return Result{
 		Outcome:     outcome,
 		ObservedFor: observedFor,
 		ByteIndex:   e.byteIndex,
 	}
+}
+
+func resetObservationLocked(e *entry) {
+	e.mutatedAt = time.Time{}
+	e.observeFor = 0
+	e.byteIndex = 0
+	e.lastObserved = time.Time{}
+	e.done = false
+	e.outcome = OutcomeUnknown
+	e.frozen = Result{}
 }
 
 func classifySignal(sig Signal) (Outcome, bool) {

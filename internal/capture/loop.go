@@ -32,6 +32,13 @@ const (
 	recvKindOutboundObserve recvKind = iota
 	recvKindOutboundBlock
 	recvKindInboundObserve
+	recvKindInboundBlock
+	recvKindBidirectionalBlock
+)
+
+const (
+	mutationDirectionOut = "out"
+	mutationDirectionIn  = "in"
 )
 
 type recvEvent struct {
@@ -66,14 +73,24 @@ func BuildOutboundConnectionFilter(key session.Key) string {
 
 // RunLoop 运行抓包、篡改、重注入与结果观察主循环。
 func RunLoop(ctx context.Context, cfg config.Config, logger *slog.Logger, outHandle, inHandle packetHandle) error {
-	return runLoopWithHandles(ctx, cfg, logger, nil, outHandle, inHandle, nil)
+	return runLoopWithHandles(ctx, cfg, logger, nil, outHandle, inHandle, nil, nil)
+}
+
+// RunDirectLoop 运行 direct-mode 主循环，显式区分出站观察、出站阻断和入站句柄角色。
+func RunDirectLoop(
+	ctx context.Context,
+	cfg config.Config,
+	logger *slog.Logger,
+	outObserveHandle, outBlockHandle, inObserveHandle, inBlockHandle packetHandle,
+) error {
+	return runLoopWithHandles(ctx, cfg, logger, outObserveHandle, outBlockHandle, inObserveHandle, inBlockHandle, nil)
 }
 
 func runLoopWithHandles(
 	ctx context.Context,
 	cfg config.Config,
 	logger *slog.Logger,
-	outObserveHandle, outBlockHandle, inHandle packetHandle,
+	outObserveHandle, outBlockHandle, inObserveHandle, inBlockHandle packetHandle,
 	newBlockHandle blockerFactory,
 ) error {
 	logger = ensureLogger(logger)
@@ -86,6 +103,7 @@ func runLoopWithHandles(
 	events := make(chan recvEvent, 4)
 	deadlines := make(map[session.Key]time.Time)
 	blockers := make(map[session.Key]packetHandle)
+	observeDirections := make(map[session.Key]string)
 
 	var (
 		wg        sync.WaitGroup
@@ -101,8 +119,11 @@ func runLoopWithHandles(
 			if outBlockHandle != nil {
 				_ = outBlockHandle.Close()
 			}
-			if inHandle != nil {
-				_ = inHandle.Close()
+			if inObserveHandle != nil {
+				_ = inObserveHandle.Close()
+			}
+			if inBlockHandle != nil {
+				_ = inBlockHandle.Close()
 			}
 			for _, handle := range blockers {
 				_ = handle.Close()
@@ -148,6 +169,12 @@ func runLoopWithHandles(
 		}
 		timerC = timer.C
 	}
+	directionFor := func(key session.Key) string {
+		if direction, ok := observeDirections[key]; ok && direction != "" {
+			return direction
+		}
+		return mutationDirectionOut
+	}
 	shutdown := func(err error) error {
 		cancel()
 		stopTimer()
@@ -163,6 +190,12 @@ func runLoopWithHandles(
 		}
 		delete(blockers, key)
 		_ = handle.Close()
+	}
+	cleanupConnection := func(key session.Key) {
+		delete(deadlines, key)
+		delete(observeDirections, key)
+		closeDynamicBlocker(key)
+		store.Forget(key)
 	}
 
 	startReader := func(handle packetHandle, kind recvKind, key session.Key) {
@@ -197,9 +230,13 @@ func runLoopWithHandles(
 		readers++
 		startReader(outBlockHandle, recvKindOutboundBlock, session.Key{})
 	}
-	if inHandle != nil {
+	if inObserveHandle != nil {
 		readers++
-		startReader(inHandle, recvKindInboundObserve, session.Key{})
+		startReader(inObserveHandle, recvKindInboundObserve, session.Key{})
+	}
+	if inBlockHandle != nil {
+		readers++
+		startReader(inBlockHandle, recvKindInboundBlock, session.Key{})
 	}
 
 	for readers > 0 || len(deadlines) > 0 {
@@ -213,10 +250,8 @@ func runLoopWithHandles(
 					continue
 				}
 				result := store.Observe(key, session.Signal{})
-				logResultOnce(logger, reported, store, key, result, "timeout")
-				delete(deadlines, key)
-				closeDynamicBlocker(key)
-				store.Forget(key)
+				logResultOnce(logger, reported, store, key, result, "timeout", directionFor(key))
+				cleanupConnection(key)
 			}
 			resetTimer()
 		case event := <-events:
@@ -229,7 +264,7 @@ func runLoopWithHandles(
 					readers--
 					continue
 				}
-				if event.kind == recvKindOutboundBlock {
+				if event.kind == recvKindOutboundBlock && event.key != (session.Key{}) {
 					if _, exists := blockers[event.key]; !exists {
 						logger.Debug(
 							"忽略已关闭动态阻断句柄返回的预期读错误",
@@ -253,8 +288,7 @@ func runLoopWithHandles(
 					return shutdown(err)
 				}
 				if cleanup {
-					delete(deadlines, key)
-					closeDynamicBlocker(key)
+					cleanupConnection(key)
 					resetTimer()
 				}
 				if matched && newBlockHandle != nil {
@@ -270,28 +304,68 @@ func runLoopWithHandles(
 				}
 				continue
 			case recvKindOutboundBlock:
-				key, mutated, cleanup, err := processBlockedOutbound(cfg, logger, store, event.key, event.packet, event.addr, eventSender(event.key, outBlockHandle, blockers))
+				resultDirection := mutationDirectionOut
+				if meta, err := tcpmeta.ParseIPv4TCP(event.packet); err == nil && matchesOutbound(cfg, meta) {
+					resultDirection = directionFor(outboundKey(meta))
+					if event.key != (session.Key{}) {
+						resultDirection = directionFor(event.key)
+					}
+				}
+
+				key, mutated, cleanup, err := processBlockedOutbound(cfg, logger, store, event.key, event.packet, event.addr, eventSender(event.key, outBlockHandle, blockers), resultDirection)
 				if err != nil {
 					return shutdown(err)
 				}
 				if cleanup {
-					delete(deadlines, key)
-					closeDynamicBlocker(key)
+					cleanupConnection(key)
 					resetTimer()
 				}
 				if mutated {
-					// 只有真正完成过一次篡改的连接才进入观察窗口。
+					observeDirections[key] = mutationDirectionOut
 					deadlines[key] = time.Now().Add(cfg.ObserveTimeout)
 					resetTimer()
 				}
 			case recvKindInboundObserve:
-				key, result, observed, cleanup, err := processInbound(logger, store, reported, cfg, event.packet)
+				resultDirection := mutationDirectionOut
+				if meta, err := tcpmeta.ParseIPv4TCP(event.packet); err == nil && matchesInbound(cfg, meta) {
+					resultDirection = directionFor(inboundKey(meta))
+				}
+
+				key, result, observed, mutated, cleanup, err := processInbound(logger, store, reported, cfg, event.packet, event.addr, nil, resultDirection)
 				if err != nil {
 					return shutdown(err)
 				}
+				if mutated {
+					observeDirections[key] = mutationDirectionIn
+					deadlines[key] = time.Now().Add(cfg.ObserveTimeout)
+					resetTimer()
+				}
 				if cleanup {
+					cleanupConnection(key)
+					resetTimer()
+				}
+				if observed && result.Outcome != session.OutcomeUnknown {
 					delete(deadlines, key)
 					closeDynamicBlocker(key)
+					resetTimer()
+				}
+			case recvKindInboundBlock:
+				resultDirection := mutationDirectionOut
+				if meta, err := tcpmeta.ParseIPv4TCP(event.packet); err == nil && matchesInbound(cfg, meta) {
+					resultDirection = directionFor(inboundKey(meta))
+				}
+
+				key, result, observed, mutated, cleanup, err := processInbound(logger, store, reported, cfg, event.packet, event.addr, eventSender(event.key, inBlockHandle, blockers), resultDirection)
+				if err != nil {
+					return shutdown(err)
+				}
+				if mutated {
+					observeDirections[key] = mutationDirectionIn
+					deadlines[key] = time.Now().Add(cfg.ObserveTimeout)
+					resetTimer()
+				}
+				if cleanup {
+					cleanupConnection(key)
 					resetTimer()
 				}
 				if observed && result.Outcome != session.OutcomeUnknown {
@@ -323,6 +397,7 @@ func processObservedOutbound(
 		return session.Key{}, false, false, nil
 	}
 
+	store.AckInboundUpTo(key, meta.Ack)
 	signal := observeSignal(false, meta)
 	matched := false
 
@@ -372,6 +447,7 @@ func processBlockedOutbound(
 	packet []byte,
 	addr any,
 	handle packetHandle,
+	resultDirection string,
 ) (session.Key, bool, bool, error) {
 	meta, err := tcpmeta.ParseIPv4TCP(packet)
 	if err != nil {
@@ -387,6 +463,7 @@ func processBlockedOutbound(
 		return session.Key{}, false, false, handle.Send(packet, addr)
 	}
 
+	store.AckInboundUpTo(key, meta.Ack)
 	signal := observeSignal(false, meta)
 
 	if handle == nil {
@@ -471,6 +548,7 @@ func processBlockedOutbound(
 		enteredObservation := store.TryMarkMutated(key, cfg.ObserveTimeout, byteIndex)
 		logger.Info(
 			"命中完整 application data 破坏点",
+			"direction", mutationDirectionOut,
 			"trace_id", store.TraceID(key),
 			"client_ip", key.ClientIP,
 			"client_port", key.ClientPort,
@@ -485,82 +563,97 @@ func processBlockedOutbound(
 		return nil
 	}
 
-	pendingPoints := store.PendingMutationPoints(key)
-	for _, point := range pendingPoints {
-		if applied, ok := mutate.ApplyMutationPoint(meta.Payload, meta.Seq, point); ok {
-			recordMutation(applied)
-		}
-	}
-	payloadAfterPendingMutations := append([]byte(nil), meta.Payload...)
-
-	state := store.Reassembly(key, meta.Seq)
-	points, err := state.Push(reassembly.Segment{
-		Seq:  meta.Seq,
-		Data: originalPayload,
-	}, cfg.MutateOffset)
-	if err != nil {
-		if errors.Is(err, reassembly.ErrBufferLimitExceeded) {
-			copy(meta.Payload, payloadAfterPendingMutations)
-
-			if err := refreshObservationWindow(); err != nil {
-				return session.Key{}, false, false, err
+	if mutatesOutbound(cfg) {
+		pendingPoints := store.OutboundPendingMutationPoints(key)
+		for _, point := range pendingPoints {
+			if applied, ok := mutate.ApplyMutationPoint(meta.Payload, meta.Seq, point); ok {
+				recordMutation(applied)
 			}
+		}
+		payloadAfterPendingMutations := append([]byte(nil), meta.Payload...)
 
+		state := store.OutboundReassembly(key, meta.Seq)
+		points, err := state.Push(reassembly.Segment{
+			Seq:  meta.Seq,
+			Data: originalPayload,
+		}, cfg.MutateOffset)
+		if err != nil {
+			if errors.Is(err, reassembly.ErrBufferLimitExceeded) {
+				copy(meta.Payload, payloadAfterPendingMutations)
+
+				if err := refreshObservationWindow(); err != nil {
+					return session.Key{}, false, false, err
+				}
+
+				logger.Debug(
+					"出站最小重组触发保守放行",
+					"direction", mutationDirectionOut,
+					"client_ip", key.ClientIP,
+					"client_port", key.ClientPort,
+					"server_ip", key.ServerIP,
+					"server_port", key.ServerPort,
+					"seq", meta.Seq,
+					"payload_len", len(meta.Payload),
+					"error", err,
+				)
+
+				if err := handle.Send(packet, addr); err != nil {
+					return session.Key{}, false, false, err
+				}
+				if isTerminalSignal(signal) {
+					if !store.HasMutation(key) {
+						store.Forget(key)
+						return key, packetMutated, true, nil
+					}
+					result := store.Observe(key, signal)
+					logResultOnce(logger, nil, store, key, result, signalReason(signal), resultDirection)
+					store.Forget(key)
+					return key, packetMutated, true, nil
+				}
+				return key, packetMutated, false, nil
+			}
+			return session.Key{}, false, false, err
+		}
+		for _, point := range points {
+			store.AddOutboundMutationPoint(key, point)
+			if applied, ok := mutate.ApplyMutationPoint(meta.Payload, meta.Seq, point); ok {
+				recordMutation(applied)
+			}
+		}
+
+		if cfg.TargetHost != "" && !packetMutated && (len(pendingPoints) > 0 || payloadStartsApplicationData(meta.Payload)) {
 			logger.Debug(
-				"出站最小重组触发保守放行",
+				"目标连接已命中，但当前包尚未覆盖破坏点",
+				"direction", mutationDirectionOut,
+				"trace_id", store.TraceID(key),
 				"client_ip", key.ClientIP,
 				"client_port", key.ClientPort,
 				"server_ip", key.ServerIP,
 				"server_port", key.ServerPort,
+				"target_host", cfg.TargetHost,
 				"seq", meta.Seq,
 				"payload_len", len(meta.Payload),
-				"error", err,
+				"pending_points", len(pendingPoints),
 			)
-
-			if err := handle.Send(packet, addr); err != nil {
-				return session.Key{}, false, false, err
-			}
-			if isTerminalSignal(signal) && !store.HasMutation(key) {
-				store.Forget(key)
-				return key, false, true, nil
-			}
-			return key, packetMutated, false, nil
 		}
-		return session.Key{}, false, false, err
-	}
-	for _, point := range points {
-		store.AddMutationPoint(key, point)
-		if applied, ok := mutate.ApplyMutationPoint(meta.Payload, meta.Seq, point); ok {
-			recordMutation(applied)
+
+		if err := refreshObservationWindow(); err != nil {
+			return session.Key{}, false, false, err
 		}
 	}
 
-	if cfg.TargetHost != "" && !packetMutated && (len(pendingPoints) > 0 || payloadStartsApplicationData(meta.Payload)) {
-		logger.Debug(
-			"目标连接已命中，但当前包尚未覆盖破坏点",
-			"trace_id", store.TraceID(key),
-			"client_ip", key.ClientIP,
-			"client_port", key.ClientPort,
-			"server_ip", key.ServerIP,
-			"server_port", key.ServerPort,
-			"target_host", cfg.TargetHost,
-			"seq", meta.Seq,
-			"payload_len", len(meta.Payload),
-			"pending_points", len(pendingPoints),
-		)
-	}
-
-	if err := refreshObservationWindow(); err != nil {
-		return session.Key{}, false, false, err
-	}
-
-	// 未命中可篡改 record 时仍然需要原样放行数据包，保证实验工具只在命中时修改流量。
 	if err := handle.Send(packet, addr); err != nil {
 		return session.Key{}, false, false, err
 	}
-	if isTerminalSignal(signal) && !store.HasMutation(key) {
+	if isTerminalSignal(signal) {
+		if !store.HasMutation(key) {
+			store.Forget(key)
+			return key, packetMutated, true, nil
+		}
+		result := store.Observe(key, signal)
+		logResultOnce(logger, nil, store, key, result, signalReason(signal), resultDirection)
 		store.Forget(key)
-		return key, false, true, nil
+		return key, packetMutated, true, nil
 	}
 	return key, packetMutated, false, nil
 }
@@ -573,7 +666,7 @@ func processOutbound(
 	packet []byte,
 	addr any,
 ) (session.Key, bool, bool, error) {
-	return processBlockedOutbound(cfg, logger, store, session.Key{}, packet, addr, handle)
+	return processBlockedOutbound(cfg, logger, store, session.Key{}, packet, addr, handle, mutationDirectionOut)
 }
 
 func eventSender(key session.Key, static packetHandle, blockers map[session.Key]packetHandle) packetHandle {
@@ -591,34 +684,190 @@ func processInbound(
 	reported map[session.Key]struct{},
 	cfg config.Config,
 	packet []byte,
-) (session.Key, session.Result, bool, bool, error) {
+	addr any,
+	handle packetHandle,
+	resultDirection string,
+) (session.Key, session.Result, bool, bool, bool, error) {
 	meta, err := tcpmeta.ParseIPv4TCP(packet)
 	if err != nil {
 		logger.Debug("跳过无法解析的入站数据包", "error", err)
-		return session.Key{}, session.Result{}, false, false, nil
+		return session.Key{}, session.Result{}, false, false, false, nil
 	}
 	if !matchesInbound(cfg, meta) {
-		return session.Key{}, session.Result{}, false, false, nil
+		return session.Key{}, session.Result{}, false, false, false, nil
 	}
 
 	key := inboundKey(meta)
-	store.AckUpTo(key, meta.Ack)
+	store.AckOutboundUpTo(key, meta.Ack)
 	signal := observeSignal(true, meta)
+	if !isConnectionMatched(cfg, store, key) {
+		if handle != nil {
+			if err := handle.Send(packet, addr); err != nil {
+				return session.Key{}, session.Result{}, false, false, false, err
+			}
+		}
+		if isTerminalSignal(signal) && !store.HasMutation(key) {
+			store.Forget(key)
+			return key, session.Result{}, true, false, true, nil
+		}
+		return key, session.Result{}, false, false, false, nil
+	}
+
+	if !mutatesInbound(cfg) {
+		if handle != nil {
+			if err := handle.Send(packet, addr); err != nil {
+				return session.Key{}, session.Result{}, false, false, false, err
+			}
+		}
+		if !store.HasMutation(key) {
+			if isTerminalSignal(signal) {
+				store.Forget(key)
+				return key, session.Result{}, true, false, true, nil
+			}
+			return key, session.Result{}, false, false, false, nil
+		}
+
+		result := store.Observe(key, signal)
+		logResultOnce(logger, reported, store, key, result, signalReason(signal), resultDirection)
+		cleanup := isTerminalSignal(signal) || result.Outcome != session.OutcomeUnknown
+		if cleanup {
+			store.Forget(key)
+		}
+		return key, result, true, false, cleanup, nil
+	}
+
+	originalPayload := append([]byte(nil), meta.Payload...)
+	packetMutated := false
+	var firstAppliedMutation *mutate.AppliedMutation
+	recordMutation := func(applied mutate.AppliedMutation) {
+		if firstAppliedMutation == nil {
+			appliedCopy := applied
+			firstAppliedMutation = &appliedCopy
+		}
+		packetMutated = true
+	}
+	refreshObservationWindow := func() error {
+		if !packetMutated {
+			return nil
+		}
+		if firstAppliedMutation == nil {
+			return fmt.Errorf("篡改入站 TLS 密文失败: 未找到已应用的篡改点")
+		}
+
+		byteIndex := meta.PayloadOffset + firstAppliedMutation.PayloadIndex
+		enteredObservation := store.TryMarkMutated(key, cfg.ObserveTimeout, byteIndex)
+		logger.Info(
+			"命中完整 application data 破坏点",
+			"direction", mutationDirectionIn,
+			"trace_id", store.TraceID(key),
+			"client_ip", key.ClientIP,
+			"client_port", key.ClientPort,
+			"server_ip", key.ServerIP,
+			"server_port", key.ServerPort,
+			"payload_index", firstAppliedMutation.PayloadIndex,
+			"packet_index", byteIndex,
+			"old_byte", fmt.Sprintf("%02x", firstAppliedMutation.OldByte),
+			"new_byte", fmt.Sprintf("%02x", firstAppliedMutation.NewByte),
+			"first_observation", enteredObservation,
+		)
+		return nil
+	}
+
+	pendingPoints := store.InboundPendingMutationPoints(key)
+	for _, point := range pendingPoints {
+		if applied, ok := mutate.ApplyMutationPoint(meta.Payload, meta.Seq, point); ok {
+			recordMutation(applied)
+		}
+	}
+	payloadAfterPendingMutations := append([]byte(nil), meta.Payload...)
+
+	state := store.InboundReassembly(key, meta.Seq)
+	points, err := state.Push(reassembly.Segment{
+		Seq:  meta.Seq,
+		Data: originalPayload,
+	}, cfg.MutateOffset)
+	if err != nil {
+		if errors.Is(err, reassembly.ErrBufferLimitExceeded) {
+			copy(meta.Payload, payloadAfterPendingMutations)
+
+			if err := refreshObservationWindow(); err != nil {
+				return session.Key{}, session.Result{}, false, false, false, err
+			}
+
+			logger.Debug(
+				"入站最小重组触发保守放行",
+				"direction", mutationDirectionIn,
+				"client_ip", key.ClientIP,
+				"client_port", key.ClientPort,
+				"server_ip", key.ServerIP,
+				"server_port", key.ServerPort,
+				"seq", meta.Seq,
+				"payload_len", len(meta.Payload),
+				"error", err,
+			)
+
+			if handle != nil {
+				if err := handle.Send(packet, addr); err != nil {
+					return session.Key{}, session.Result{}, false, false, false, err
+				}
+			}
+			return key, session.Result{}, false, packetMutated, false, nil
+		}
+		return session.Key{}, session.Result{}, false, false, false, err
+	}
+	for _, point := range points {
+		store.AddInboundMutationPoint(key, point)
+		if applied, ok := mutate.ApplyMutationPoint(meta.Payload, meta.Seq, point); ok {
+			recordMutation(applied)
+		}
+	}
+
+	if cfg.TargetHost != "" && !packetMutated && (len(pendingPoints) > 0 || payloadStartsApplicationData(meta.Payload)) {
+		logger.Debug(
+			"目标连接已命中，但当前包尚未覆盖破坏点",
+			"direction", mutationDirectionIn,
+			"trace_id", store.TraceID(key),
+			"client_ip", key.ClientIP,
+			"client_port", key.ClientPort,
+			"server_ip", key.ServerIP,
+			"server_port", key.ServerPort,
+			"target_host", cfg.TargetHost,
+			"seq", meta.Seq,
+			"payload_len", len(meta.Payload),
+			"pending_points", len(pendingPoints),
+		)
+	}
+
+	if err := refreshObservationWindow(); err != nil {
+		return session.Key{}, session.Result{}, false, false, false, err
+	}
+
+	if handle != nil {
+		if err := handle.Send(packet, addr); err != nil {
+			return session.Key{}, session.Result{}, false, false, false, err
+		}
+	}
+
 	if !store.HasMutation(key) {
 		if isTerminalSignal(signal) {
 			store.Forget(key)
-			return key, session.Result{}, true, true, nil
+			return key, session.Result{}, true, false, true, nil
 		}
-		return key, session.Result{}, false, false, nil
+		return key, session.Result{}, false, packetMutated, false, nil
+	}
+
+	// 首次入站篡改与终止信号可能落在同一个包里，此时调用方还没来得及刷新观察方向。
+	if packetMutated {
+		resultDirection = mutationDirectionIn
 	}
 
 	result := store.Observe(key, signal)
-	logResultOnce(logger, reported, store, key, result, signalReason(signal))
+	logResultOnce(logger, reported, store, key, result, signalReason(signal), resultDirection)
 	cleanup := isTerminalSignal(signal) || result.Outcome != session.OutcomeUnknown
 	if cleanup {
 		store.Forget(key)
 	}
-	return key, result, true, cleanup, nil
+	return key, result, true, packetMutated, cleanup, nil
 }
 
 func ensureLogger(logger *slog.Logger) *slog.Logger {
@@ -634,6 +883,14 @@ func matchesOutbound(cfg config.Config, meta tcpmeta.Packet) bool {
 
 func matchesInbound(cfg config.Config, meta tcpmeta.Packet) bool {
 	return matchesPortAndOptionalIP(cfg, meta, false)
+}
+
+func mutatesOutbound(cfg config.Config) bool {
+	return cfg.MutateDirection == "out" || cfg.MutateDirection == "both" || cfg.MutateDirection == ""
+}
+
+func mutatesInbound(cfg config.Config) bool {
+	return cfg.MutateDirection == "in" || cfg.MutateDirection == "both"
 }
 
 func matchesPortAndOptionalIP(cfg config.Config, meta tcpmeta.Packet, outbound bool) bool {
@@ -719,6 +976,7 @@ func logResultOnce(
 	key session.Key,
 	result session.Result,
 	reason string,
+	direction string,
 ) {
 	if result.Outcome == session.OutcomeUnknown {
 		return
@@ -726,13 +984,16 @@ func logResultOnce(
 	if result.Outcome == session.OutcomeNoConclusion && reason != "timeout" {
 		return
 	}
-	if _, ok := reported[key]; ok {
-		return
+	if reported != nil {
+		if _, ok := reported[key]; ok {
+			return
+		}
+		reported[key] = struct{}{}
 	}
-	reported[key] = struct{}{}
 
 	logger.Info(
 		"连接观察结果",
+		"direction", direction,
 		"trace_id", store.TraceID(key),
 		"client_ip", key.ClientIP,
 		"client_port", key.ClientPort,

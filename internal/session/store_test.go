@@ -130,6 +130,98 @@ func TestStoreForgetClearsConnectionState(t *testing.T) {
 	}
 }
 
+func TestStoreResetMutationKeepsMatchedStateAndTraceID(t *testing.T) {
+	store := NewStore(func() time.Time { return time.Unix(100, 0) })
+	key := testSessionKey()
+
+	store.MarkMatched(key)
+	traceID := store.TraceID(key)
+	if traceID == "" {
+		t.Fatal("expected trace id after MarkMatched")
+	}
+
+	first := store.TryMarkMutated(key, 5*time.Second, 45)
+	if !first {
+		t.Fatal("expected first mutation to report first observation")
+	}
+
+	store.ResetObservation(key)
+
+	if got := store.MatchState(key); got != MatchStateMatched {
+		t.Fatalf("expected matched state to survive observation reset, got %q", got)
+	}
+	if got := store.TraceID(key); got != traceID {
+		t.Fatalf("expected trace id to survive observation reset, got %q want %q", got, traceID)
+	}
+	if store.HasMutation(key) {
+		t.Fatal("expected mutation state to be cleared after observation reset")
+	}
+	if first := store.TryMarkMutated(key, 5*time.Second, 46); !first {
+		t.Fatal("expected next mutation round to be treated as a new first observation")
+	}
+}
+
+func TestStoreForgetStillRemovesEntireConnectionState(t *testing.T) {
+	store := NewStore(func() time.Time { return time.Unix(100, 0) })
+	key := testSessionKey()
+
+	store.MarkMatched(key)
+	traceID := store.TraceID(key)
+	store.TryMarkMutated(key, 5*time.Second, 45)
+
+	store.Forget(key)
+
+	if got := store.MatchState(key); got != MatchStateUnknown {
+		t.Fatalf("expected forget to remove match state, got %q", got)
+	}
+	if got := store.TraceID(key); got != "" {
+		t.Fatalf("expected forget to remove trace id, got %q (old %q)", got, traceID)
+	}
+	if store.HasMutation(key) {
+		t.Fatal("expected forget to clear mutation state")
+	}
+}
+
+func TestStoreResetObservationClearsTerminalRoundBeforeRestart(t *testing.T) {
+	now := time.Unix(100, 0)
+	store := NewStore(func() time.Time { return now })
+	key := testSessionKey()
+
+	if !store.TryMarkMutated(key, 5*time.Second, 45) {
+		t.Fatal("expected first mutation to report first observation")
+	}
+
+	first := store.Observe(key, Signal{FromServer: true, RST: true})
+	if first.Outcome != OutcomeDefiniteFailure {
+		t.Fatalf("expected terminal result before reset, got %s", first.Outcome)
+	}
+	if first.ByteIndex != 45 {
+		t.Fatalf("expected first round byte index 45, got %d", first.ByteIndex)
+	}
+
+	store.ResetObservation(key)
+
+	if got := store.Observe(key, Signal{FromServer: true, RST: true}); got.Outcome != OutcomeNoConclusion {
+		t.Fatalf("expected reset to clear terminal round before restart, got %s", got.Outcome)
+	}
+
+	if !store.TryMarkMutated(key, 3*time.Second, 99) {
+		t.Fatal("expected new round to report first observation")
+	}
+	now = now.Add(2 * time.Second)
+
+	second := store.Observe(key, Signal{FromServer: true, RST: true})
+	if second.Outcome != OutcomeDefiniteFailure {
+		t.Fatalf("expected restarted round to classify terminal signal, got %s", second.Outcome)
+	}
+	if second.ObservedFor != 2*time.Second {
+		t.Fatalf("expected restarted round to use new observe window, got %s", second.ObservedFor)
+	}
+	if second.ByteIndex != 99 {
+		t.Fatalf("expected restarted round to use new byte index 99, got %d", second.ByteIndex)
+	}
+}
+
 func TestStoreMutatesOnlyOncePerConnection(t *testing.T) {
 	store := NewStore(func() time.Time { return time.Unix(100, 0) })
 	key := testSessionKey()
@@ -319,6 +411,91 @@ func TestStoreDropsMutationPointsAfterAckCoversTargetSeq(t *testing.T) {
 	store.AckUpTo(key, 2003)
 	if got := len(store.PendingMutationPoints(key)); got != 0 {
 		t.Fatalf("expected mutation point to be cleared after ack, got %d", got)
+	}
+}
+
+func TestStoreSeparatesOutboundAndInboundReassemblyState(t *testing.T) {
+	store := NewStore(func() time.Time { return time.Unix(100, 0) })
+	key := testSessionKey()
+
+	outbound := store.OutboundReassembly(key, 1000)
+	if outbound == nil {
+		t.Fatal("expected outbound reassembly state to be created")
+	}
+	inbound := store.InboundReassembly(key, 2000)
+	if inbound == nil {
+		t.Fatal("expected inbound reassembly state to be created")
+	}
+
+	if outbound == inbound {
+		t.Fatal("expected outbound and inbound reassembly states to be different instances")
+	}
+	if got := outbound.NextSeq(); got != 1000 {
+		t.Fatalf("expected outbound next seq 1000, got %d", got)
+	}
+	if got := inbound.NextSeq(); got != 2000 {
+		t.Fatalf("expected inbound next seq 2000, got %d", got)
+	}
+}
+
+func TestStoreSeparatesOutboundAndInboundPendingMutationPoints(t *testing.T) {
+	store := NewStore(func() time.Time { return time.Unix(100, 0) })
+	key := testSessionKey()
+
+	outboundPoint := reassembly.MutationPoint{TargetSeq: 2002}
+	inboundPoint := reassembly.MutationPoint{TargetSeq: 3002}
+
+	store.AddOutboundMutationPoint(key, outboundPoint)
+	store.AddInboundMutationPoint(key, inboundPoint)
+
+	outbound := store.OutboundPendingMutationPoints(key)
+	if got := len(outbound); got != 1 {
+		t.Fatalf("expected one outbound pending point, got %d", got)
+	}
+	if outbound[0] != outboundPoint {
+		t.Fatalf("unexpected outbound pending point: %+v", outbound[0])
+	}
+
+	inbound := store.InboundPendingMutationPoints(key)
+	if got := len(inbound); got != 1 {
+		t.Fatalf("expected one inbound pending point, got %d", got)
+	}
+	if inbound[0] != inboundPoint {
+		t.Fatalf("unexpected inbound pending point: %+v", inbound[0])
+	}
+}
+
+func TestStoreInboundAckClearsOutboundPointsOnly(t *testing.T) {
+	store := NewStore(func() time.Time { return time.Unix(100, 0) })
+	key := testSessionKey()
+
+	store.AddOutboundMutationPoint(key, reassembly.MutationPoint{TargetSeq: 2002})
+	store.AddInboundMutationPoint(key, reassembly.MutationPoint{TargetSeq: 3002})
+
+	store.AckOutboundUpTo(key, 2003)
+
+	if got := len(store.OutboundPendingMutationPoints(key)); got != 0 {
+		t.Fatalf("expected outbound pending points to be cleared, got %d", got)
+	}
+	if got := len(store.InboundPendingMutationPoints(key)); got != 1 {
+		t.Fatalf("expected inbound pending point to remain, got %d", got)
+	}
+}
+
+func TestStoreOutboundAckClearsInboundPointsOnly(t *testing.T) {
+	store := NewStore(func() time.Time { return time.Unix(100, 0) })
+	key := testSessionKey()
+
+	store.AddOutboundMutationPoint(key, reassembly.MutationPoint{TargetSeq: 2002})
+	store.AddInboundMutationPoint(key, reassembly.MutationPoint{TargetSeq: 3002})
+
+	store.AckInboundUpTo(key, 3003)
+
+	if got := len(store.OutboundPendingMutationPoints(key)); got != 1 {
+		t.Fatalf("expected outbound pending point to remain, got %d", got)
+	}
+	if got := len(store.InboundPendingMutationPoints(key)); got != 0 {
+		t.Fatalf("expected inbound pending points to be cleared, got %d", got)
 	}
 }
 
