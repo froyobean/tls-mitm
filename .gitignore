@@ -1,0 +1,6 @@
+.worktrees/
+.gocache/
+.gomodcache/
+bin/
+build/
+*.test.exe
