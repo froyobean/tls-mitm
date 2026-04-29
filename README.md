@@ -48,22 +48,22 @@
 - `in`
   只篡改入站方向。直连模式下会阻断并重注入入站包；`target-host` 模式下会在 `SNI` 命中后才为该连接创建专用入站 blocker。
 - `both`
-  双向都允许篡改。`target-host` 模式下会在命中后创建单个双向 blocker。
+  双向都允许篡改。`target-host` 模式下会在命中后分别创建出站 blocker 和入站 blocker。
 
 `target-host` 模式下的句柄编排如下：
 
 - `out`
-  始终先用 outbound `sniff` 句柄识别 `ClientHello/SNI`，命中后只创建 outbound blocker。
+  始终先用 outbound `sniff` 句柄识别目标连接，命中后只创建 outbound blocker。
 - `in`
-  始终先用 outbound `sniff` 句柄识别 `ClientHello/SNI`，命中后只创建 inbound blocker。
+  始终先用 outbound `sniff` 句柄识别目标连接，命中后只创建 inbound blocker。
 - `both`
-  始终先用 outbound `sniff` 句柄识别 `ClientHello/SNI`，命中后创建 bidirectional blocker。
+  始终先用 outbound `sniff` 句柄识别目标连接，命中后分别创建 outbound blocker 和 inbound blocker。
 
 非目标连接在 `target-host` 模式下始终只观察、不阻断。
 
 ## `target-host` 持续连接说明
 
-仅提供 `-target-host` 时，工具无法在打开主阻断句柄前用固定 IP 收窄范围，因此会先用 outbound `sniff` 句柄观察目标端口上的 `ClientHello/SNI`。当某条 TCP 连接的 `SNI` 命中目标域名后，工具会为该连接四元组创建专用阻断句柄。
+仅提供 `-target-host` 时，工具无法在打开主阻断句柄前用固定 IP 收窄范围，因此会先用 outbound `sniff` 句柄观察目标端口上的连接建立与 TLS 负载。当某条 TCP 连接通过 `SNI`、`DNS` 或二者组合模式命中目标后，工具会为该连接四元组创建专用阻断句柄。
 
 专用阻断句柄的生命周期按“连接”而不是按“观察轮次”管理：
 
@@ -73,6 +73,7 @@
 - 收到 `RST` 或观察到双向 `FIN` 后，会按连接结束释放该连接状态。
 - 普通长空闲连接不会仅因观察窗口结束而释放，后续同一连接的 `Application Data record` 仍会继续被篡改。
 - 如果只观察到单边 `FIN` 后另一端长期没有结束连接，会通过半关闭静默兜底释放状态，避免专用阻断句柄长期驻留。
+- 入站模式下，如果后续同连接活动仍在持续，内部观察窗口会随活动刷新，避免过早把仍在重传中的连接直接判成 `no_conclusion`。
 
 ## `-host-match` 说明
 
@@ -83,7 +84,20 @@
 - `both`
   使用 `SNI OR DNS` 语义：只要 `SNI` 命中，或者目标连接的服务端 IP 命中最近观察到的目标域名 DNS 解析结果，就会接管该 TCP 连接。
 
-DNS 模式只观察明文 `UDP/53` DNS 响应，不支持 `DoH`、`DoT`、`DoQ`，也不会修改 DNS 包。`both` 模式采用 `SNI OR DNS` 语义：只要 `SNI` 或 DNS 解析 IP 任一命中，就会接管该 TCP 连接；如果 DNS 命中但 `SNI` 不同，程序会输出冲突日志并继续按 DNS 命中处理。
+DNS 模式只观察明文 `UDP/53` DNS 响应，不支持 `DoH`、`DoT`、`DoQ`，也不会修改 DNS 包。`both` 模式采用 `SNI OR DNS` 语义：只要 `SNI` 或 DNS 解析 IP 任一命中，就会接管该 TCP 连接；如果 DNS 命中但 `SNI` 不同，程序会输出冲突日志并继续按 DNS 命中处理。对于 `dns` 或 `both` 模式，即使当前连接里没有可用的 `SNI`，只要 DNS 命中也仍然可能进入篡改链路。
+
+## 观察结果说明
+
+工具当前会把单轮篡改后的观察结果记录为以下几类：
+
+- `definite_failure`
+  已明确观察到较强失败信号，例如服务端返回 `RST`。
+- `probable_failure`
+  已观察到较强但非绝对的失败迹象，例如 `FIN`、疑似 `TLS alert`，或入站篡改后出现同一变异分片的重传。
+- `no_conclusion`
+  在当前观察窗口内没有拿到足够的失败信号。
+
+日志中的 `reason` 字段用于解释本轮结果来源，常见值包括 `rst`、`fin`、`alert`、`retransmit`、`timeout`。
 
 ## 运行示例
 
@@ -254,10 +268,10 @@ make test GO=/mingw64/bin/go.exe
 
 - `go test ./...`
 - 抓包循环、连接状态机、TLS record 识别与密文翻转的单元测试
+- Windows 管理员权限下的 WinDivert 实机验证，已覆盖 `target-ip + out`、`host-match both + mutate-direction both`、`host-match sni + mutate-direction in` 以及非法 `-log-format` 参数
 
 当前尚未在仓库内自动化完成的部分：
 
-- 真实 WinDivert 联机实验
 - 驱动分发与安装自动化
 - 完整通用 / 双向 TCP 流重组
 - TLS 解密
