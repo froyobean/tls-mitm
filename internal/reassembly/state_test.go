@@ -276,3 +276,34 @@ func TestStateSkipsTooShortApplicationDataForMutateOffset(t *testing.T) {
 		t.Fatalf("expected too-short record to be skipped for mutate offset 4, got %d", len(points))
 	}
 }
+
+func TestStateCanResyncAfterMiddleOfRecordPrefix(t *testing.T) {
+	state := NewState(1000)
+
+	// 模拟动态阻断句柄在连接中途接入：先看到一段非记录边界的密文前缀。
+	points, err := state.Push(Segment{
+		Seq:  1000,
+		Data: []byte{0x88, 0x99, 0xaa, 0xbb, 0xcc},
+	}, 0)
+	if err != nil {
+		t.Fatalf("Push returned error: %v", err)
+	}
+	if len(points) != 0 {
+		t.Fatalf("expected no mutation point for middle-of-record prefix, got %d", len(points))
+	}
+
+	// 后续到达一个完整 application data record，重组器应能重新同步并产出破坏点。
+	points, err = state.Push(Segment{
+		Seq:  1005,
+		Data: []byte{0x17, 0x03, 0x03, 0x00, 0x04, 0xaa, 0xbb, 0xcc, 0xdd},
+	}, 0)
+	if err != nil {
+		t.Fatalf("Push returned error: %v", err)
+	}
+	if len(points) != 1 {
+		t.Fatalf("expected one mutation point after resync, got %d", len(points))
+	}
+	if points[0].TargetSeq != 1010 {
+		t.Fatalf("expected target seq 1010 after resync, got %d", points[0].TargetSeq)
+	}
+}

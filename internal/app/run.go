@@ -28,6 +28,30 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	outFilter, inFilter := capture.BuildFilters(cfg)
 
 	if cfg.TargetHost == "" {
+		if cfg.TargetIP.IsValid() && cfg.MutateDirection == "out" {
+			outObserveHandle, err := capture.OpenObserveHandleWithPriority(outFilter, divert.PriorityDefault)
+			if err != nil {
+				return err
+			}
+			defer outObserveHandle.Close()
+
+			inObserveHandle, err := capture.OpenObserveHandleWithPriority(inFilter, divert.PriorityDefault)
+			if err != nil {
+				return err
+			}
+			defer inObserveHandle.Close()
+
+			blockFactory := func(key session.Key) (*capture.Handle, error) {
+				handle, err := capture.OpenHandleWithPriority(capture.BuildOutboundConnectionFilter(key), divert.PriorityHighest)
+				if err != nil {
+					return nil, fmt.Errorf("为直连命中连接创建专用出站阻断句柄失败: %w", err)
+				}
+				return handle, nil
+			}
+
+			return capture.RunDirectDeferredLoop(ctx, cfg, logger, outObserveHandle, inObserveHandle, blockFactory)
+		}
+
 		outObserveHandle, outBlockHandle, err := openOutboundHandlesForDirectMode(cfg, outFilter)
 		if err != nil {
 			return err
@@ -53,28 +77,50 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		return capture.RunDirectLoop(ctx, cfg, logger, outObserveHandle, outBlockHandle, inObserveHandle, inBlockHandle)
 	}
 
-	outObserveHandle, err := capture.OpenObserveHandleWithPriority(outFilter, divert.PriorityHighest)
+	outObserveHandle, err := capture.OpenObserveHandleWithPriority(outFilter, divert.PriorityDefault)
 	if err != nil {
 		return err
 	}
 	defer outObserveHandle.Close()
 
-	inObserveHandle, err := capture.OpenObserveHandleWithPriority(inFilter, divert.PriorityHighest)
+	inObserveHandle, err := capture.OpenObserveHandleWithPriority(inFilter, divert.PriorityDefault)
 	if err != nil {
 		return err
 	}
 	defer inObserveHandle.Close()
 
-	blockFactory := func(key session.Key) (*capture.Handle, error) {
-		filter := hostBlockFilter(cfg, key)
-		handle, err := capture.OpenHandleWithPriority(filter, divert.PriorityDefault)
+	var dnsObserveHandle *capture.Handle
+	if cfg.HostMatch == "dns" || cfg.HostMatch == "both" {
+		dnsObserveHandle, err = capture.OpenObserveHandleWithPriority(capture.BuildDNSResponseFilter(), divert.PriorityDefault)
 		if err != nil {
-			return nil, fmt.Errorf("为命中连接创建专用阻断句柄失败: %w", err)
+			return err
 		}
-		return handle, nil
+		defer dnsObserveHandle.Close()
 	}
 
-	return capture.RunHostMatchLoop(ctx, cfg, logger, outObserveHandle, inObserveHandle, blockFactory)
+	var outboundBlockFactory func(key session.Key) (*capture.Handle, error)
+	if cfg.MutateDirection == "out" || cfg.MutateDirection == "both" {
+		outboundBlockFactory = func(key session.Key) (*capture.Handle, error) {
+			handle, err := capture.OpenHandleWithPriority(capture.BuildOutboundConnectionFilter(key), divert.PriorityHighest)
+			if err != nil {
+				return nil, fmt.Errorf("为命中连接创建专用出站阻断句柄失败: %w", err)
+			}
+			return handle, nil
+		}
+	}
+
+	var inboundBlockFactory func(key session.Key) (*capture.Handle, error)
+	if cfg.MutateDirection == "in" || cfg.MutateDirection == "both" {
+		inboundBlockFactory = func(key session.Key) (*capture.Handle, error) {
+			handle, err := capture.OpenHandleWithPriority(capture.BuildInboundConnectionFilter(key), divert.PriorityHighest)
+			if err != nil {
+				return nil, fmt.Errorf("为命中连接创建专用入站阻断句柄失败: %w", err)
+			}
+			return handle, nil
+		}
+	}
+
+	return capture.RunDomainMatchLoopWithFactories(ctx, cfg, logger, outObserveHandle, inObserveHandle, dnsObserveHandle, outboundBlockFactory, inboundBlockFactory)
 }
 
 func openInboundHandlesForDirectMode(cfg config.Config, filter string) (*capture.Handle, *capture.Handle, error) {
@@ -93,15 +139,4 @@ func openOutboundHandlesForDirectMode(cfg config.Config, filter string) (*captur
 	}
 	handle, err := capture.OpenHandle(filter)
 	return nil, handle, err
-}
-
-func hostBlockFilter(cfg config.Config, key session.Key) string {
-	switch cfg.MutateDirection {
-	case "in":
-		return capture.BuildInboundConnectionFilter(key)
-	case "both":
-		return capture.BuildBidirectionalConnectionFilter(key)
-	default:
-		return capture.BuildOutboundConnectionFilter(key)
-	}
 }

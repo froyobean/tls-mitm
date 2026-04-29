@@ -28,6 +28,7 @@
 - `-target-port` 必填。
 - 默认情况下，`-target-ip` 与 `-target-host` 至少提供一个，可以同时提供。
 - 若未提供 `-target-ip` 和 `-target-host`，则必须显式添加 `-unsafe-any-host` 才允许启动。
+- `-host-match` 只在提供 `-target-host` 时生效，支持 `sni`、`dns`、`both`，默认值是 `sni`。
 - 当前篡改单位是“每条经最小 TCP 重组后确认完整的 TLS `Application Data record`”。
 - 每条完整 `record` 只生成一个破坏点，破坏点由 `-mutate-offset` 决定。
 - 任意覆盖该破坏点的首次发送或重传 TCP 包都会施加同样篡改。
@@ -73,6 +74,17 @@
 - 普通长空闲连接不会仅因观察窗口结束而释放，后续同一连接的 `Application Data record` 仍会继续被篡改。
 - 如果只观察到单边 `FIN` 后另一端长期没有结束连接，会通过半关闭静默兜底释放状态，避免专用阻断句柄长期驻留。
 
+## `-host-match` 说明
+
+- `sni`
+  只根据 `ClientHello` 里的 `SNI` 判断是否命中目标域名。
+- `dns`
+  只根据明文 `UDP/53` DNS 响应里解析出的目标域名到 IP 映射判断是否命中目标连接。
+- `both`
+  使用 `SNI OR DNS` 语义：只要 `SNI` 命中，或者目标连接的服务端 IP 命中最近观察到的目标域名 DNS 解析结果，就会接管该 TCP 连接。
+
+DNS 模式只观察明文 `UDP/53` DNS 响应，不支持 `DoH`、`DoT`、`DoQ`，也不会修改 DNS 包。`both` 模式采用 `SNI OR DNS` 语义：只要 `SNI` 或 DNS 解析 IP 任一命中，就会接管该 TCP 连接；如果 DNS 命中但 `SNI` 不同，程序会输出冲突日志并继续按 DNS 命中处理。
+
 ## 运行示例
 
 仅按 IP 匹配，默认只改出站：
@@ -99,6 +111,18 @@
 .\build\tls-mitm.exe -target-host example.com -target-port 443 -observe-timeout 5s -mutate-offset 0 -mutate-direction both
 ```
 
+仅按域名匹配，并启用 `SNI OR DNS`：
+
+```powershell
+.\build\tls-mitm.exe -target-host www.bing.com -target-port 443 -host-match both
+```
+
+仅按域名匹配，并只使用 DNS 命中：
+
+```powershell
+.\build\tls-mitm.exe -target-host www.bing.com -target-port 443 -host-match dns
+```
+
 按 `IP + 域名` 交集匹配，双向都改：
 
 ```powershell
@@ -115,6 +139,7 @@
 
 - `-target-ip`：按目标服务器 IP 匹配，可选
 - `-target-host`：按 TLS `SNI` 域名匹配，可选
+- `-host-match sni|dns|both`：域名命中方式，默认 `sni`
 - `-target-port`：目标服务器端口，必填
 - `-observe-timeout`：篡改后的观察窗口
 - `-mutate-offset`：决定命中的 `Application Data record` 在密文区内哪个偏移生成破坏点；若 `record` 太短则保守跳过

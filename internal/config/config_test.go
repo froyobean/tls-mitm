@@ -36,6 +36,48 @@ func TestParseArgsSupportsTargetIPAndTargetHost(t *testing.T) {
 	}
 }
 
+func TestParseArgsDefaultsHostMatchToSNI(t *testing.T) {
+	cfg, err := ParseArgs([]string{"-target-host", "example.com", "-target-port", "443"})
+	if err != nil {
+		t.Fatalf("ParseArgs returned error: %v", err)
+	}
+	if cfg.HostMatch != "sni" {
+		t.Fatalf("expected default host match sni, got %q", cfg.HostMatch)
+	}
+}
+
+func TestParseArgsAcceptsHostMatchModes(t *testing.T) {
+	for _, mode := range []string{"sni", "dns", "both"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg, err := ParseArgs([]string{"-target-host", "example.com", "-target-port", "443", "-host-match", mode})
+			if err != nil {
+				t.Fatalf("ParseArgs returned error: %v", err)
+			}
+			if cfg.HostMatch != mode {
+				t.Fatalf("expected host match %q, got %q", mode, cfg.HostMatch)
+			}
+		})
+	}
+}
+
+func TestParseArgsRejectsInvalidHostMatch(t *testing.T) {
+	if _, err := ParseArgs([]string{"-target-host", "example.com", "-target-port", "443", "-host-match", "strict"}); err == nil || !strings.Contains(err.Error(), "host-match") {
+		t.Fatalf("expected host-match error, got %v", err)
+	}
+}
+
+func TestParseArgsRejectsDNSHostMatchWithoutTargetHost(t *testing.T) {
+	if _, err := ParseArgs([]string{"-target-ip", "93.184.216.34", "-target-port", "443", "-host-match", "dns"}); err == nil || !strings.Contains(err.Error(), "target-host") {
+		t.Fatalf("expected target-host error, got %v", err)
+	}
+}
+
+func TestParseArgsRejectsBothHostMatchWithoutTargetHost(t *testing.T) {
+	if _, err := ParseArgs([]string{"-target-ip", "93.184.216.34", "-target-port", "443", "-host-match", "both"}); err == nil || !strings.Contains(err.Error(), "target-host") {
+		t.Fatalf("expected target-host error, got %v", err)
+	}
+}
+
 func TestParseArgsRejectsMissingTargetSelectors(t *testing.T) {
 	if _, err := ParseArgs([]string{"-target-port", "443"}); err == nil {
 		t.Fatal("expected error")
@@ -98,6 +140,12 @@ func TestParseArgsRejectsInvalidMutateDirection(t *testing.T) {
 	}
 }
 
+func TestParseArgsRejectsInvalidLogFormat(t *testing.T) {
+	if _, err := ParseArgs([]string{"-target-ip", "93.184.216.34", "-target-port", "443", "-log-format", "xml"}); err == nil || !strings.Contains(err.Error(), "log-format") {
+		t.Fatalf("expected log-format error, got %v", err)
+	}
+}
+
 func TestParseArgsHelp(t *testing.T) {
 	if _, err := ParseArgs([]string{"-h"}); !errors.Is(err, ErrHelpRequested) {
 		t.Fatalf("expected ErrHelpRequested, got %v", err)
@@ -106,7 +154,7 @@ func TestParseArgsHelp(t *testing.T) {
 
 func TestUsageIncludesFlags(t *testing.T) {
 	usage := Usage()
-	for _, want := range []string{"-h", "-target-ip", "-target-host", "-target-port", "-observe-timeout", "-log-format", "-mutate-offset", "-mutate-direction", "-unsafe-any-host"} {
+	for _, want := range []string{"-h", "-target-ip", "-target-host", "-target-port", "-observe-timeout", "-log-format", "-mutate-offset", "-mutate-direction", "-host-match", "-unsafe-any-host"} {
 		if !strings.Contains(usage, want) {
 			t.Fatalf("usage missing %q: %s", want, usage)
 		}
@@ -116,6 +164,20 @@ func TestUsageIncludesFlags(t *testing.T) {
 func TestUsageMentionsMutateDirection(t *testing.T) {
 	usage := Usage()
 	for _, want := range []string{"-mutate-direction <方向>", "out、in 或 both"} {
+		if !strings.Contains(usage, want) {
+			t.Fatalf("usage missing %q: %s", want, usage)
+		}
+	}
+}
+
+func TestUsageMentionsHostMatch(t *testing.T) {
+	usage := Usage()
+	for _, want := range []string{
+		"-host-match <模式>",
+		"sni、dns 或 both",
+		"tls-mitm -target-host example.com -target-port 443 -host-match both",
+		"tls-mitm -target-host www.bing.com -target-port 443 -host-match dns",
+	} {
 		if !strings.Contains(usage, want) {
 			t.Fatalf("usage missing %q: %s", want, usage)
 		}
@@ -162,6 +224,7 @@ func TestUsageKeepsFlagOrder(t *testing.T) {
 	logFormatIndex := strings.Index(usage, "-log-format")
 	mutateOffsetIndex := strings.Index(usage, "-mutate-offset")
 	mutateDirectionIndex := strings.Index(usage, "-mutate-direction")
+	hostMatchIndex := strings.Index(usage, "-host-match")
 	unsafeAnyHostIndex := strings.Index(usage, "-unsafe-any-host")
 	helpIndex := strings.Index(usage, "-h, -help")
 	if !(targetPortIndex < targetIPIndex &&
@@ -170,7 +233,8 @@ func TestUsageKeepsFlagOrder(t *testing.T) {
 		observeTimeoutIndex < logFormatIndex &&
 		logFormatIndex < mutateOffsetIndex &&
 		mutateOffsetIndex < mutateDirectionIndex &&
-		mutateDirectionIndex < unsafeAnyHostIndex &&
+		mutateDirectionIndex < hostMatchIndex &&
+		hostMatchIndex < unsafeAnyHostIndex &&
 		unsafeAnyHostIndex < helpIndex) {
 		t.Fatalf("unexpected usage order: %s", usage)
 	}

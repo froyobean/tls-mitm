@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"reflect"
 	"sync"
 	"time"
 
@@ -26,6 +27,20 @@ type packetHandle interface {
 
 type blockerFactory func(key session.Key) (packetHandle, error)
 
+func hasPacketHandle(handle packetHandle) bool {
+	if handle == nil {
+		return false
+	}
+
+	value := reflect.ValueOf(handle)
+	switch value.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan:
+		return !value.IsNil()
+	default:
+		return true
+	}
+}
+
 type recvKind uint8
 
 const (
@@ -34,6 +49,7 @@ const (
 	recvKindInboundObserve
 	recvKindInboundBlock
 	recvKindBidirectionalBlock
+	recvKindDNSObserve
 )
 
 const (
@@ -60,10 +76,15 @@ func BuildFilters(cfg config.Config) (string, string) {
 		fmt.Sprintf("(inbound and tcp and ip and tcp.SrcPort == %d)", cfg.TargetPort)
 }
 
+// BuildDNSResponseFilter 构造入站明文 DNS 响应观察过滤表达式。
+func BuildDNSResponseFilter() string {
+	return "(inbound and udp and ip and udp.SrcPort == 53)"
+}
+
 // BuildOutboundConnectionFilter 为单条已命中的连接构造专用出站阻断过滤表达式。
 func BuildOutboundConnectionFilter(key session.Key) string {
 	return fmt.Sprintf(
-		"(outbound and tcp and ip and ip.SrcAddr == %s and tcp.SrcPort == %d and ip.DstAddr == %s and tcp.DstPort == %d)",
+		"(outbound and tcp and ip and !impostor and ip.SrcAddr == %s and tcp.SrcPort == %d and ip.DstAddr == %s and tcp.DstPort == %d)",
 		key.ClientIP,
 		key.ClientPort,
 		key.ServerIP,
@@ -84,6 +105,23 @@ func RunDirectLoop(
 	outObserveHandle, outBlockHandle, inObserveHandle, inBlockHandle packetHandle,
 ) error {
 	return runLoopWithHandles(ctx, cfg, logger, outObserveHandle, outBlockHandle, inObserveHandle, inBlockHandle, nil)
+}
+
+// RunDirectDeferredLoop 运行 direct-mode 的“先观察、后阻断”主循环。
+func RunDirectDeferredLoop(
+	ctx context.Context,
+	cfg config.Config,
+	logger *slog.Logger,
+	outObserveHandle, inObserveHandle packetHandle,
+	newBlockHandle func(key session.Key) (*Handle, error),
+) error {
+	var factory blockerFactory
+	if newBlockHandle != nil {
+		factory = func(key session.Key) (packetHandle, error) {
+			return newBlockHandle(key)
+		}
+	}
+	return runLoopWithHandles(ctx, cfg, logger, outObserveHandle, nil, inObserveHandle, nil, factory)
 }
 
 func runLoopWithHandles(
@@ -113,20 +151,22 @@ func runLoopWithHandles(
 	)
 	closeHandles := func() {
 		closeOnce.Do(func() {
-			if outObserveHandle != nil {
+			if hasPacketHandle(outObserveHandle) {
 				_ = outObserveHandle.Close()
 			}
-			if outBlockHandle != nil {
+			if hasPacketHandle(outBlockHandle) {
 				_ = outBlockHandle.Close()
 			}
-			if inObserveHandle != nil {
+			if hasPacketHandle(inObserveHandle) {
 				_ = inObserveHandle.Close()
 			}
-			if inBlockHandle != nil {
+			if hasPacketHandle(inBlockHandle) {
 				_ = inBlockHandle.Close()
 			}
 			for _, handle := range blockers {
-				_ = handle.Close()
+				if hasPacketHandle(handle) {
+					_ = handle.Close()
+				}
 			}
 		})
 	}
@@ -199,7 +239,7 @@ func runLoopWithHandles(
 	}
 
 	startReader := func(handle packetHandle, kind recvKind, key session.Key) {
-		if handle == nil {
+		if !hasPacketHandle(handle) {
 			return
 		}
 
@@ -222,19 +262,19 @@ func runLoopWithHandles(
 	}
 
 	readers := 0
-	if outObserveHandle != nil {
+	if hasPacketHandle(outObserveHandle) {
 		readers++
 		startReader(outObserveHandle, recvKindOutboundObserve, session.Key{})
 	}
-	if outBlockHandle != nil {
+	if hasPacketHandle(outBlockHandle) {
 		readers++
 		startReader(outBlockHandle, recvKindOutboundBlock, session.Key{})
 	}
-	if inObserveHandle != nil {
+	if hasPacketHandle(inObserveHandle) {
 		readers++
 		startReader(inObserveHandle, recvKindInboundObserve, session.Key{})
 	}
-	if inBlockHandle != nil {
+	if hasPacketHandle(inBlockHandle) {
 		readers++
 		startReader(inBlockHandle, recvKindInboundBlock, session.Key{})
 	}
@@ -340,6 +380,10 @@ func runLoopWithHandles(
 					deadlines[key] = time.Now().Add(cfg.ObserveTimeout)
 					resetTimer()
 				}
+				if observed && result.Outcome == session.OutcomeUnknown {
+					deadlines[key] = time.Now().Add(cfg.ObserveTimeout)
+					resetTimer()
+				}
 				if cleanup {
 					cleanupConnection(key)
 					resetTimer()
@@ -361,6 +405,10 @@ func runLoopWithHandles(
 				}
 				if mutated {
 					observeDirections[key] = mutationDirectionIn
+					deadlines[key] = time.Now().Add(cfg.ObserveTimeout)
+					resetTimer()
+				}
+				if observed && result.Outcome == session.OutcomeUnknown {
 					deadlines[key] = time.Now().Add(cfg.ObserveTimeout)
 					resetTimer()
 				}
@@ -401,7 +449,12 @@ func processObservedOutbound(
 	signal := observeSignal(false, meta)
 	matched := false
 
-	if shouldResolveHost(cfg, store, key) {
+	if cfg.TargetHost == "" {
+		if len(meta.Payload) > 0 {
+			store.MarkMatched(key)
+			matched = true
+		}
+	} else if shouldResolveHost(cfg, store, key) {
 		if serverName, ok := tlshello.ParseServerName(meta.Payload); ok {
 			if hostMatches(cfg, serverName) {
 				store.MarkMatched(key)
@@ -672,8 +725,13 @@ func processOutbound(
 func eventSender(key session.Key, static packetHandle, blockers map[session.Key]packetHandle) packetHandle {
 	if key != (session.Key{}) {
 		if handle, ok := blockers[key]; ok {
-			return handle
+			if hasPacketHandle(handle) {
+				return handle
+			}
 		}
+	}
+	if !hasPacketHandle(static) {
+		return nil
 	}
 	return static
 }
@@ -700,6 +758,7 @@ func processInbound(
 	key := inboundKey(meta)
 	store.AckOutboundUpTo(key, meta.Ack)
 	signal := observeSignal(true, meta)
+
 	if !isConnectionMatched(cfg, store, key) {
 		if handle != nil {
 			if err := handle.Send(packet, addr); err != nil {
@@ -739,6 +798,7 @@ func processInbound(
 	originalPayload := append([]byte(nil), meta.Payload...)
 	packetMutated := false
 	var firstAppliedMutation *mutate.AppliedMutation
+	retransmittedMutation := false
 	recordMutation := func(applied mutate.AppliedMutation) {
 		if firstAppliedMutation == nil {
 			appliedCopy := applied
@@ -841,6 +901,9 @@ func processInbound(
 	if err := refreshObservationWindow(); err != nil {
 		return session.Key{}, session.Result{}, false, false, false, err
 	}
+	if packetMutated && firstAppliedMutation != nil {
+		retransmittedMutation = store.NoteInboundMutationHit(key, meta.Seq, firstAppliedMutation.TargetSeq)
+	}
 
 	if handle != nil {
 		if err := handle.Send(packet, addr); err != nil {
@@ -859,6 +922,11 @@ func processInbound(
 	// 首次入站篡改与终止信号可能落在同一个包里，此时调用方还没来得及刷新观察方向。
 	if packetMutated {
 		resultDirection = mutationDirectionIn
+	}
+	if retransmittedMutation {
+		result := store.Observe(key, session.Signal{FromServer: true, Retransmit: true})
+		logResultOnce(logger, reported, store, key, result, "retransmit", resultDirection)
+		return key, result, true, packetMutated, true, nil
 	}
 
 	result := store.Observe(key, signal)
@@ -908,10 +976,24 @@ func matchesPortAndOptionalIP(cfg config.Config, meta tcpmeta.Packet, outbound b
 }
 
 func shouldResolveHost(cfg config.Config, store *session.Store, key session.Key) bool {
-	if cfg.TargetHost == "" {
+	if !usesSNI(cfg) {
 		return false
 	}
 	return store.MatchState(key) == session.MatchStateUnknown
+}
+
+func usesSNI(cfg config.Config) bool {
+	if cfg.TargetHost == "" {
+		return false
+	}
+	return cfg.HostMatch == "" || cfg.HostMatch == "sni" || cfg.HostMatch == "both"
+}
+
+func usesDNS(cfg config.Config) bool {
+	if cfg.TargetHost == "" {
+		return false
+	}
+	return cfg.HostMatch == "dns" || cfg.HostMatch == "both"
 }
 
 func hostMatches(cfg config.Config, name string) bool {
@@ -945,6 +1027,7 @@ func inboundKey(meta tcpmeta.Packet) session.Key {
 
 func observeSignal(fromServer bool, meta tcpmeta.Packet) session.Signal {
 	return session.Signal{
+		Activity:   true,
 		FromServer: fromServer,
 		RST:        meta.TCPFlags&0x04 != 0,
 		FIN:        meta.TCPFlags&0x01 != 0,
@@ -956,6 +1039,8 @@ func signalReason(sig session.Signal) string {
 	switch {
 	case sig.RST:
 		return "rst"
+	case sig.Retransmit:
+		return "retransmit"
 	case sig.FIN:
 		return "fin"
 	case sig.Alert:
@@ -1017,6 +1102,14 @@ func payloadStartsApplicationData(payload []byte) bool {
 	}
 	version := uint16(payload[1])<<8 | uint16(payload[2])
 	return payload[0] == 0x17 && isTLSVersion(version)
+}
+
+func payloadStartsHandshake(payload []byte) bool {
+	if len(payload) < 5 {
+		return false
+	}
+	version := uint16(payload[1])<<8 | uint16(payload[2])
+	return payload[0] == 0x16 && isTLSVersion(version)
 }
 
 type tlsPacketRecord struct {

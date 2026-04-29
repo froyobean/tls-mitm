@@ -45,10 +45,12 @@ const (
 
 // Signal 描述一次与连接状态相关的外部观测信号。
 type Signal struct {
+	Activity   bool
 	FromServer bool
 	RST        bool
 	FIN        bool
 	Alert      bool
+	Retransmit bool
 }
 
 // Result 描述一条连接当前或最终的观察结果。
@@ -70,6 +72,7 @@ type entry struct {
 	traceID      string
 	mutatedAt    time.Time
 	observeFor   time.Duration
+	observeUntil time.Time
 	byteIndex    int
 	matchState   MatchState
 	hasMutation  bool
@@ -85,6 +88,9 @@ type directionState struct {
 	reassembly    *reassembly.State
 	pendingPoints []reassembly.MutationPoint
 	lastAck       uint32
+	lastHitSeq    uint32
+	lastHitTarget uint32
+	hitCount      int
 }
 
 // NewStore 创建一份新的连接状态存储。
@@ -248,6 +254,15 @@ func (s *Store) AckInboundUpTo(key Key, ack uint32) {
 	ackUpTo(&e.inbound, ack)
 }
 
+// NoteInboundMutationHit 记录一次命中入站篡改点的数据包，返回其是否属于重复命中。
+func (s *Store) NoteInboundMutationHit(key Key, packetSeq uint32, targetSeq uint32) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e := s.ensureEntryLocked(key)
+	return noteMutationHit(&e.inbound, packetSeq, targetSeq)
+}
+
 // AckUpTo 保留给现有调用方使用，语义映射到出站方向。
 func (s *Store) AckUpTo(key Key, ack uint32) {
 	s.AckOutboundUpTo(key, ack)
@@ -268,6 +283,9 @@ func (s *Store) MarkExcluded(key Key) {
 	defer s.mu.Unlock()
 
 	e := s.ensureEntryLocked(key)
+	if e.matchState == MatchStateMatched {
+		return
+	}
 	e.matchState = MatchStateExcluded
 }
 
@@ -304,10 +322,12 @@ func (s *Store) TryMarkMutated(key Key, observe time.Duration, byteIndex int) bo
 
 	e := s.ensureEntryLocked(key)
 	firstMutation := !e.hasMutation
+	now := s.now()
 	resetObservationLocked(e)
 	e.hasMutation = true
-	e.mutatedAt = s.now()
+	e.mutatedAt = now
 	e.observeFor = observe
+	e.observeUntil = now.Add(observe)
 	e.byteIndex = byteIndex
 	return firstMutation
 }
@@ -331,16 +351,21 @@ func (s *Store) Observe(key Key, sig Signal) Result {
 	}
 
 	observedFor := now.Sub(e.mutatedAt)
-	if observedFor >= e.observeFor {
+	if outcome, ok := classifySignal(sig); ok {
 		e.done = true
-		e.outcome = OutcomeNoConclusion
+		e.outcome = outcome
 		e.frozen = s.buildResultLocked(e, e.outcome, observedFor)
 		return e.frozen
 	}
 
-	if outcome, ok := classifySignal(sig); ok {
+	if sig.Activity {
+		e.observeUntil = now.Add(e.observeFor)
+		return s.buildResultLocked(e, OutcomeUnknown, observedFor)
+	}
+
+	if !e.observeUntil.IsZero() && !now.Before(e.observeUntil) {
 		e.done = true
-		e.outcome = outcome
+		e.outcome = OutcomeNoConclusion
 		e.frozen = s.buildResultLocked(e, e.outcome, observedFor)
 		return e.frozen
 	}
@@ -405,6 +430,17 @@ func ackUpTo(state *directionState, ack uint32) {
 	state.pendingPoints = filtered
 }
 
+func noteMutationHit(state *directionState, packetSeq uint32, targetSeq uint32) bool {
+	if state.lastHitSeq == packetSeq && state.lastHitTarget == targetSeq {
+		state.hitCount++
+		return state.hitCount > 1
+	}
+	state.lastHitSeq = packetSeq
+	state.lastHitTarget = targetSeq
+	state.hitCount = 1
+	return false
+}
+
 func (s *Store) buildResultLocked(e *entry, outcome Outcome, observedFor time.Duration) Result {
 	return Result{
 		Outcome:     outcome,
@@ -416,6 +452,7 @@ func (s *Store) buildResultLocked(e *entry, outcome Outcome, observedFor time.Du
 func resetObservationLocked(e *entry) {
 	e.mutatedAt = time.Time{}
 	e.observeFor = 0
+	e.observeUntil = time.Time{}
 	e.byteIndex = 0
 	e.lastObserved = time.Time{}
 	e.done = false
@@ -426,6 +463,9 @@ func resetObservationLocked(e *entry) {
 func classifySignal(sig Signal) (Outcome, bool) {
 	if sig.FromServer && sig.RST {
 		return OutcomeDefiniteFailure, true
+	}
+	if sig.FromServer && sig.Retransmit {
+		return OutcomeProbableFailure, true
 	}
 	if sig.FIN || sig.Alert || sig.RST {
 		return OutcomeProbableFailure, true

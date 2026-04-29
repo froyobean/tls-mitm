@@ -17,7 +17,7 @@ func testSessionKey() Key {
 	}
 }
 
-func TestStoreSupportsMatchStateTransitions(t *testing.T) {
+func TestStoreSupportsUnknownToMatchedTransition(t *testing.T) {
 	store := NewStore(func() time.Time { return time.Unix(100, 0) })
 	key := testSessionKey()
 
@@ -29,10 +29,31 @@ func TestStoreSupportsMatchStateTransitions(t *testing.T) {
 	if got := store.MatchState(key); got != MatchStateMatched {
 		t.Fatalf("unexpected matched state: %s", got)
 	}
+}
+
+func TestStoreSupportsUnknownToExcludedTransition(t *testing.T) {
+	store := NewStore(func() time.Time { return time.Unix(100, 0) })
+	key := testSessionKey()
+
+	if got := store.MatchState(key); got != MatchStateUnknown {
+		t.Fatalf("unexpected initial match state: %s", got)
+	}
 
 	store.MarkExcluded(key)
 	if got := store.MatchState(key); got != MatchStateExcluded {
 		t.Fatalf("unexpected excluded state: %s", got)
+	}
+}
+
+func TestStoreMatchedStateIsNotOverwrittenByExclude(t *testing.T) {
+	store := NewStore(func() time.Time { return time.Unix(100, 0) })
+	key := testSessionKey()
+
+	store.MarkMatched(key)
+	store.MarkExcluded(key)
+
+	if got := store.MatchState(key); got != MatchStateMatched {
+		t.Fatalf("expected matched state to win over later exclude, got %s", got)
 	}
 }
 
@@ -396,6 +417,29 @@ func TestRepeatedMutationRefreshesObserveWindow(t *testing.T) {
 	}
 	if got.ByteIndex != 9 {
 		t.Fatalf("expected latest mutation byte index to be observed, got %d", got.ByteIndex)
+	}
+}
+
+func TestActivitySignalRefreshesObserveWindow(t *testing.T) {
+	now := time.Unix(100, 0)
+	store := NewStore(func() time.Time { return now })
+	key := testSessionKey()
+
+	store.MarkMutated(key, 5*time.Second, 8)
+
+	now = now.Add(4 * time.Second)
+	got := store.Observe(key, Signal{Activity: true})
+	if got.Outcome != OutcomeUnknown {
+		t.Fatalf("expected activity signal to keep observation pending, got %s", got.Outcome)
+	}
+
+	now = now.Add(3 * time.Second)
+	got = store.Observe(key, Signal{FromServer: true, RST: true})
+	if got.Outcome != OutcomeDefiniteFailure {
+		t.Fatalf("expected refreshed activity window to classify later RST as definite_failure, got %s", got.Outcome)
+	}
+	if got.ObservedFor != 7*time.Second {
+		t.Fatalf("expected observed duration to stay anchored at first mutation, got %s", got.ObservedFor)
 	}
 }
 

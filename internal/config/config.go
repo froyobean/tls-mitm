@@ -21,6 +21,7 @@ type Config struct {
 	LogFormat       string
 	MutateOffset    int
 	MutateDirection string
+	HostMatch       string
 	UnsafeAnyHost   bool
 }
 
@@ -31,7 +32,7 @@ var ErrHelpRequested = errors.New("help requested")
 func ParseArgs(args []string) (Config, error) {
 	fs := newFlagSet(io.Discard)
 
-	targetIP, targetHost, targetPort, observeTimeout, logFormat, mutateOffset, mutateDirection, unsafeAnyHost, showHelp := bindFlags(fs)
+	targetIP, targetHost, targetPort, observeTimeout, logFormat, mutateOffset, mutateDirection, hostMatch, unsafeAnyHost, showHelp := bindFlags(fs)
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -46,6 +47,8 @@ func ParseArgs(args []string) (Config, error) {
 	normalizedTargetIP := strings.TrimSpace(*targetIP)
 	normalizedTargetHost := normalizeTargetHost(*targetHost)
 	normalizedMutateDirection := normalizeMutateDirection(*mutateDirection)
+	normalizedHostMatch := normalizeHostMatch(*hostMatch)
+	normalizedLogFormat := normalizeLogFormat(*logFormat)
 
 	if normalizedTargetIP == "" && normalizedTargetHost == "" && !*unsafeAnyHost {
 		return Config{}, errors.New("至少需要提供 target-ip 或 target-host；如果要按端口匹配所有主机，请显式添加 -unsafe-any-host")
@@ -58,6 +61,21 @@ func ParseArgs(args []string) (Config, error) {
 	}
 	if normalizedMutateDirection != "out" && normalizedMutateDirection != "in" && normalizedMutateDirection != "both" {
 		return Config{}, fmt.Errorf("无效的 -mutate-direction: %s（仅支持 out、in 或 both）", normalizedMutateDirection)
+	}
+	if normalizedHostMatch == "" {
+		normalizedHostMatch = "sni"
+	}
+	if normalizedHostMatch != "sni" && normalizedHostMatch != "dns" && normalizedHostMatch != "both" {
+		return Config{}, fmt.Errorf("无效的 -host-match: %s（仅支持 sni、dns 或 both）", normalizedHostMatch)
+	}
+	if (normalizedHostMatch == "dns" || normalizedHostMatch == "both") && normalizedTargetHost == "" {
+		return Config{}, errors.New("-host-match dns 或 both 需要提供 target-host")
+	}
+	if normalizedLogFormat == "" {
+		normalizedLogFormat = "text"
+	}
+	if normalizedLogFormat != "text" && normalizedLogFormat != "json" {
+		return Config{}, fmt.Errorf("无效的 -log-format: %s（仅支持 text 或 json）", normalizedLogFormat)
 	}
 
 	var addr netip.Addr
@@ -77,9 +95,10 @@ func ParseArgs(args []string) (Config, error) {
 		TargetHost:      normalizedTargetHost,
 		TargetPort:      uint16(*targetPort),
 		ObserveTimeout:  *observeTimeout,
-		LogFormat:       *logFormat,
+		LogFormat:       normalizedLogFormat,
 		MutateOffset:    *mutateOffset,
 		MutateDirection: normalizedMutateDirection,
+		HostMatch:       normalizedHostMatch,
 		UnsafeAnyHost:   *unsafeAnyHost,
 	}, nil
 }
@@ -101,6 +120,7 @@ func Usage() string {
 		{name: "-log-format <格式>", description: "日志格式，可选 text 或 json", defaultValue: "text"},
 		{name: "-mutate-offset <偏移>", description: "命中 record 后要翻转的密文字节偏移", defaultValue: "0"},
 		{name: "-mutate-direction <方向>", description: "篡改方向：out、in 或 both", defaultValue: "out"},
+		{name: "-host-match <模式>", description: "域名命中方式：sni、dns 或 both", defaultValue: "sni"},
 		{name: "-unsafe-any-host", description: "显式允许按目标端口匹配所有主机"},
 		{name: "-h, -help", description: "显示帮助信息"},
 	})
@@ -111,6 +131,8 @@ func Usage() string {
 	builder.WriteString("  tls-mitm -target-ip 93.184.216.34 -target-port 443 -mutate-direction out\n")
 	builder.WriteString("  tls-mitm -target-host example.com -target-port 443 -mutate-direction in\n")
 	builder.WriteString("  tls-mitm -target-host example.com -target-port 443 -mutate-direction both\n")
+	builder.WriteString("  tls-mitm -target-host example.com -target-port 443 -host-match both\n")
+	builder.WriteString("  tls-mitm -target-host www.bing.com -target-port 443 -host-match dns\n")
 	builder.WriteString("  tls-mitm -target-port 443 -unsafe-any-host\n")
 	builder.WriteString("\n约束:\n")
 	builder.WriteString("  -target-ip 与 -target-host 至少提供一个，可以同时提供。\n")
@@ -124,7 +146,7 @@ func newFlagSet(output io.Writer) *flag.FlagSet {
 	return fs
 }
 
-func bindFlags(fs *flag.FlagSet) (*string, *string, *int, *time.Duration, *string, *int, *string, *bool, *bool) {
+func bindFlags(fs *flag.FlagSet) (*string, *string, *int, *time.Duration, *string, *int, *string, *string, *bool, *bool) {
 	targetIP := fs.String("target-ip", "", "目标 IP")
 	targetHost := fs.String("target-host", "", "目标域名")
 	targetPort := fs.Int("target-port", 0, "目标端口")
@@ -132,10 +154,11 @@ func bindFlags(fs *flag.FlagSet) (*string, *string, *int, *time.Duration, *strin
 	logFormat := fs.String("log-format", "text", "日志格式")
 	mutateOffset := fs.Int("mutate-offset", 0, "篡改偏移")
 	mutateDirection := fs.String("mutate-direction", "out", "篡改方向：out、in 或 both")
+	hostMatch := fs.String("host-match", "sni", "域名命中方式：sni、dns 或 both")
 	unsafeAnyHost := fs.Bool("unsafe-any-host", false, "显式允许按目标端口匹配所有主机")
 	showHelp := fs.Bool("h", false, "显示帮助信息")
 	fs.BoolVar(showHelp, "help", false, "显示帮助信息")
-	return targetIP, targetHost, targetPort, observeTimeout, logFormat, mutateOffset, mutateDirection, unsafeAnyHost, showHelp
+	return targetIP, targetHost, targetPort, observeTimeout, logFormat, mutateOffset, mutateDirection, hostMatch, unsafeAnyHost, showHelp
 }
 
 func normalizeTargetHost(targetHost string) string {
@@ -144,6 +167,14 @@ func normalizeTargetHost(targetHost string) string {
 
 func normalizeMutateDirection(mutateDirection string) string {
 	return strings.ToLower(strings.TrimSpace(mutateDirection))
+}
+
+func normalizeHostMatch(hostMatch string) string {
+	return strings.ToLower(strings.TrimSpace(hostMatch))
+}
+
+func normalizeLogFormat(logFormat string) string {
+	return strings.ToLower(strings.TrimSpace(logFormat))
 }
 
 type usageItem struct {

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"tls-mitm/internal/config"
+	"tls-mitm/internal/dnscache"
 	"tls-mitm/internal/reassembly"
 	"tls-mitm/internal/session"
 )
@@ -39,6 +40,132 @@ func TestBuildFiltersFallsBackToPortOnlyWithoutTargetIP(t *testing.T) {
 	}
 	if !strings.Contains(outbound, "tcp.DstPort == 443") || !strings.Contains(inbound, "tcp.SrcPort == 443") {
 		t.Fatalf("unexpected port filters: %s / %s", outbound, inbound)
+	}
+}
+
+func TestBuildDNSResponseFilter(t *testing.T) {
+	filter := BuildDNSResponseFilter()
+	for _, want := range []string{"inbound", "udp", "ip", "udp.SrcPort == 53"} {
+		if !strings.Contains(filter, want) {
+			t.Fatalf("filter missing %q: %s", want, filter)
+		}
+	}
+}
+
+func TestBuildOutboundConnectionFilterExcludesImpostorPackets(t *testing.T) {
+	filter := BuildOutboundConnectionFilter(session.Key{
+		ClientIP:   "10.0.0.2",
+		ClientPort: 50000,
+		ServerIP:   "93.184.216.34",
+		ServerPort: 443,
+	})
+	if !strings.Contains(filter, "!impostor") {
+		t.Fatalf("expected outbound connection filter to exclude impostor packets, got: %s", filter)
+	}
+}
+
+func TestBuildInboundConnectionFilterExcludesImpostorPackets(t *testing.T) {
+	filter := BuildInboundConnectionFilter(session.Key{
+		ClientIP:   "10.0.0.2",
+		ClientPort: 50000,
+		ServerIP:   "93.184.216.34",
+		ServerPort: 443,
+	})
+	if !strings.Contains(filter, "!impostor") {
+		t.Fatalf("expected inbound connection filter to exclude impostor packets, got: %s", filter)
+	}
+}
+
+func TestBuildBidirectionalConnectionFilterExcludesImpostorPackets(t *testing.T) {
+	filter := BuildBidirectionalConnectionFilter(session.Key{
+		ClientIP:   "10.0.0.2",
+		ClientPort: 50000,
+		ServerIP:   "93.184.216.34",
+		ServerPort: 443,
+	})
+	if !strings.Contains(filter, "!impostor") {
+		t.Fatalf("expected bidirectional connection filter to exclude impostor packets, got: %s", filter)
+	}
+}
+
+func TestRunLoopWithHandlesIgnoresTypedNilPacketHandles(t *testing.T) {
+	cfg := config.Config{TargetPort: 443}
+
+	var (
+		outObserve *scriptedHandle
+		outBlock   *scriptedHandle
+		inObserve  *scriptedHandle
+		inBlock    *scriptedHandle
+	)
+
+	if err := runLoopWithHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, outBlock, inObserve, inBlock, nil); err != nil {
+		t.Fatalf("runLoopWithHandles returned error: %v", err)
+	}
+}
+
+func TestRunHostMatchLoopWithHandlesIgnoresTypedNilPacketHandles(t *testing.T) {
+	cfg := config.Config{
+		TargetHost:      "www.example.com",
+		TargetPort:      443,
+		ObserveTimeout:  50 * time.Millisecond,
+		MutateOffset:    0,
+		MutateDirection: "out",
+		HostMatch:       "dns",
+	}
+
+	var (
+		outObserve *scriptedHandle
+		inObserve  *scriptedHandle
+		dnsObserve *scriptedHandle
+	)
+
+	if err := runHostMatchLoopWithHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, inObserve, dnsObserve, nil); err != nil {
+		t.Fatalf("runHostMatchLoopWithHandles returned error: %v", err)
+	}
+}
+
+func TestShouldUseSNIByHostMatchMode(t *testing.T) {
+	if !usesSNI(config.Config{TargetHost: "example.com", HostMatch: "sni"}) {
+		t.Fatal("expected sni mode to use SNI")
+	}
+	if usesSNI(config.Config{TargetHost: "example.com", HostMatch: "dns"}) {
+		t.Fatal("expected dns mode not to use SNI")
+	}
+	if !usesSNI(config.Config{TargetHost: "example.com", HostMatch: "both"}) {
+		t.Fatal("expected both mode to use SNI")
+	}
+}
+
+func TestShouldUseDNSByHostMatchMode(t *testing.T) {
+	if usesDNS(config.Config{TargetHost: "example.com", HostMatch: "sni"}) {
+		t.Fatal("expected sni mode not to use DNS")
+	}
+	if !usesDNS(config.Config{TargetHost: "example.com", HostMatch: "dns"}) {
+		t.Fatal("expected dns mode to use DNS")
+	}
+	if !usesDNS(config.Config{TargetHost: "example.com", HostMatch: "both"}) {
+		t.Fatal("expected both mode to use DNS")
+	}
+}
+
+func TestShouldArmInboundBlockerAfterObservedOutboundApplicationData(t *testing.T) {
+	clientHelloPayload := buildClientHelloPayload("example.com")
+	outboundApplicationDataPayload := outboundTLSPacketWithSeq(1)[40:]
+
+	if shouldArmInboundBlocker(config.Config{MutateDirection: "in"}, clientHelloPayload) {
+		t.Fatal("expected inbound-only mode not to arm blocker on client hello payload")
+	}
+	if !shouldArmInboundBlocker(config.Config{MutateDirection: "in"}, outboundApplicationDataPayload) {
+		t.Fatal("expected inbound-only mode to arm blocker on outbound application data payload")
+	}
+	if shouldArmInboundBlocker(config.Config{MutateDirection: "both"}, clientHelloPayload) {
+		t.Fatal("expected both mode not to arm inbound blocker on client hello payload")
+	}
+	if !shouldArmInboundBlocker(config.Config{MutateDirection: "both"}, outboundApplicationDataPayload) {
+		t.Fatal("expected both mode to arm inbound blocker on outbound application data payload")
+	}
+	if shouldArmInboundBlocker(config.Config{MutateDirection: "out"}, outboundApplicationDataPayload) {
+		t.Fatal("expected out-only mode not to arm inbound blocker")
 	}
 }
 
@@ -112,6 +239,50 @@ func TestDynamicHostOnlyModeMutatesThroughDedicatedBlocker(t *testing.T) {
 	}
 }
 
+func TestDirectIPModeDefersBlockerUntilFirstPayloadAfterSYN(t *testing.T) {
+	cfg := config.Config{
+		TargetIP:        netip.MustParseAddr("93.184.216.34"),
+		TargetPort:      443,
+		ObserveTimeout:  50 * time.Millisecond,
+		MutateOffset:    0,
+		MutateDirection: "out",
+	}
+
+	helloPayloadLen := len(buildClientHelloPayload("example.com"))
+	firstPayloadSeq := uint32(1)
+	secondPayloadSeq := firstPayloadSeq + uint32(helloPayloadLen)
+
+	outObserve := &scriptedHandle{steps: []recvStep{
+		{packet: makeIPv4TCPPacketWithSeqAck([4]byte{10, 0, 0, 2}, [4]byte{93, 184, 216, 34}, 50000, 443, 1, 0, 0x02, nil)},
+		{delay: time.Millisecond, packet: outboundClientHelloPacketToWithSeq("93.184.216.34", firstPayloadSeq, "example.com")},
+		{delay: time.Millisecond, packet: outboundTLSPacketToWithSeq("93.184.216.34", secondPayloadSeq)},
+	}}
+	blocker := &scriptedHandle{steps: []recvStep{
+		{packet: outboundTLSPacketToWithSeq("93.184.216.34", secondPayloadSeq)},
+	}}
+	factoryCalls := 0
+	factory := func(key session.Key) (packetHandle, error) {
+		factoryCalls++
+		return blocker, nil
+	}
+
+	if err := runLoopWithHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, nil, &scriptedHandle{}, nil, factory); err != nil {
+		t.Fatalf("runLoopWithHandles returned error: %v", err)
+	}
+	if factoryCalls != 1 {
+		t.Fatalf("expected direct IP mode to create one blocker after the first payload, got %d", factoryCalls)
+	}
+	if len(outObserve.sent) != 0 {
+		t.Fatalf("expected direct-mode observe handle to stay sniff-only before blocker creation, got %d sends", len(outObserve.sent))
+	}
+	if len(blocker.sent) != 1 {
+		t.Fatalf("expected dedicated blocker to capture one packet after deferred creation, got %d sends", len(blocker.sent))
+	}
+	if got := blocker.sent[0].packet[45]; got != 0x55 {
+		t.Fatalf("expected dedicated blocker to mutate ciphertext byte to 0x55, got 0x%02x", got)
+	}
+}
+
 func TestHostOnlyOutUsesRunHostMatchLoopWithHandles(t *testing.T) {
 	cfg := config.Config{
 		TargetHost:      "example.com",
@@ -135,7 +306,7 @@ func TestHostOnlyOutUsesRunHostMatchLoopWithHandles(t *testing.T) {
 		return blocker, nil
 	}
 
-	if err := runHostMatchLoopWithHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, inObserve, factory); err != nil {
+	if err := runHostMatchLoopWithHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, inObserve, nil, factory); err != nil {
 		t.Fatalf("runHostMatchLoopWithHandles returned error: %v", err)
 	}
 
@@ -153,6 +324,332 @@ func TestHostOnlyOutUsesRunHostMatchLoopWithHandles(t *testing.T) {
 	}
 }
 
+func TestHostMatchDNSModeCreatesBlockerForResolvedIP(t *testing.T) {
+	cfg := config.Config{
+		TargetHost:      "www.example.com",
+		TargetPort:      443,
+		ObserveTimeout:  50 * time.Millisecond,
+		MutateOffset:    0,
+		MutateDirection: "out",
+		HostMatch:       "dns",
+	}
+
+	dnsObserve := &scriptedHandle{steps: []recvStep{
+		{packet: dnsResponsePacketForCaptureTest("www.example.com", "93.184.216.34", 300)},
+	}}
+	outObserve := &scriptedHandle{steps: []recvStep{
+		{delay: time.Millisecond, packet: outboundTLSPacketTo("93.184.216.34")},
+	}}
+	inObserve := &scriptedHandle{}
+	blocker := &scriptedHandle{steps: []recvStep{
+		{packet: outboundTLSPacketTo("93.184.216.34")},
+	}}
+	factoryCalls := 0
+	factory := func(key session.Key) (packetHandle, error) {
+		factoryCalls++
+		return blocker, nil
+	}
+
+	if err := runHostMatchLoopWithHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, inObserve, dnsObserve, factory); err != nil {
+		t.Fatalf("runHostMatchLoopWithHandles returned error: %v", err)
+	}
+	if factoryCalls != 1 {
+		t.Fatalf("expected one DNS matched blocker, got %d", factoryCalls)
+	}
+	if got := blocker.sent[0].packet[45]; got != 0x55 {
+		t.Fatalf("expected DNS matched connection to mutate, got 0x%02x", got)
+	}
+}
+
+func TestHostMatchDNSModeSkipsRepeatedOutboundObserveAfterBlockerCreated(t *testing.T) {
+	cfg := config.Config{
+		TargetHost:      "www.example.com",
+		TargetPort:      443,
+		ObserveTimeout:  50 * time.Millisecond,
+		MutateOffset:    0,
+		MutateDirection: "out",
+		HostMatch:       "dns",
+	}
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	dnsObserve := &scriptedHandle{steps: []recvStep{
+		{packet: dnsResponsePacketForCaptureTest("www.example.com", "93.184.216.34", 300)},
+	}}
+	outObserve := &scriptedHandle{steps: []recvStep{
+		{delay: time.Millisecond, packet: outboundTLSPacketTo("93.184.216.34")},
+		{delay: time.Millisecond, packet: outboundTLSPacketToWithSeq("93.184.216.34", 9)},
+		{delay: time.Millisecond, packet: outboundTLSPacketToWithSeq("93.184.216.34", 18)},
+	}}
+	blocker := &scriptedHandle{steps: []recvStep{
+		{delay: 2 * time.Millisecond, packet: outboundTLSPacketTo("93.184.216.34")},
+	}}
+	factoryCalls := 0
+	factory := func(key session.Key) (packetHandle, error) {
+		factoryCalls++
+		return blocker, nil
+	}
+
+	if err := runHostMatchLoopWithHandles(context.Background(), cfg, logger, outObserve, &scriptedHandle{}, dnsObserve, factory); err != nil {
+		t.Fatalf("runHostMatchLoopWithHandles returned error: %v", err)
+	}
+	if factoryCalls != 1 {
+		t.Fatalf("expected one DNS matched blocker, got %d", factoryCalls)
+	}
+	if got := strings.Count(logs.String(), "msg=\"DNS 命中目标连接\""); got != 1 {
+		t.Fatalf("expected outbound observe to stop logging repeated DNS hits after blocker creation, got %d logs: %s", got, logs.String())
+	}
+}
+
+func TestHostMatchDNSModeWaitsForPayloadBeforeCreatingBlocker(t *testing.T) {
+	cfg := config.Config{
+		TargetHost:      "www.example.com",
+		TargetPort:      443,
+		ObserveTimeout:  50 * time.Millisecond,
+		MutateOffset:    0,
+		MutateDirection: "out",
+		HostMatch:       "dns",
+	}
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	dnsObserve := &scriptedHandle{steps: []recvStep{
+		{packet: dnsResponsePacketForCaptureTest("www.example.com", "93.184.216.34", 300)},
+	}}
+	outObserve := &scriptedHandle{steps: []recvStep{
+		{delay: time.Millisecond, packet: makeIPv4TCPPacketWithSeqAck([4]byte{10, 0, 0, 2}, [4]byte{93, 184, 216, 34}, 50000, 443, 1, 1, 0x10, nil)},
+		{delay: time.Millisecond, packet: outboundClientHelloPacketToWithSeq("93.184.216.34", 1, "www.example.com")},
+	}}
+	blocker := &scriptedHandle{steps: []recvStep{
+		{packet: outboundTLSPacketToWithSeq("93.184.216.34", uint32(len(buildClientHelloPayload("www.example.com"))+1))},
+	}}
+	factoryCalls := 0
+	factory := func(key session.Key) (packetHandle, error) {
+		factoryCalls++
+		return blocker, nil
+	}
+
+	if err := runHostMatchLoopWithHandles(context.Background(), cfg, logger, outObserve, &scriptedHandle{}, dnsObserve, factory); err != nil {
+		t.Fatalf("runHostMatchLoopWithHandles returned error: %v", err)
+	}
+	if factoryCalls != 0 {
+		t.Fatalf("expected DNS ACK match to defer blocker creation on the first payload, got %d", factoryCalls)
+	}
+	if got := strings.Count(logs.String(), "msg=\"DNS 命中目标连接\""); got != 1 {
+		t.Fatalf("expected DNS hit to be logged once before payload-driven blocker creation, got %d logs: %s", got, logs.String())
+	}
+	if len(blocker.sent) != 0 {
+		t.Fatalf("expected deferred blocker not to capture the first payload-carrying packet, got %d sends", len(blocker.sent))
+	}
+}
+
+func TestHostMatchDNSModeDefersBlockerUntilSecondPayloadAfterACKMatch(t *testing.T) {
+	cfg := config.Config{
+		TargetHost:      "www.example.com",
+		TargetPort:      443,
+		ObserveTimeout:  50 * time.Millisecond,
+		MutateOffset:    0,
+		MutateDirection: "out",
+		HostMatch:       "dns",
+	}
+
+	helloPayloadLen := len(buildClientHelloPayload("www.example.com"))
+	firstPayloadSeq := uint32(1)
+	secondPayloadSeq := firstPayloadSeq + uint32(helloPayloadLen)
+	thirdPayloadSeq := secondPayloadSeq + 9
+
+	dnsObserve := &scriptedHandle{steps: []recvStep{
+		{packet: dnsResponsePacketForCaptureTest("www.example.com", "93.184.216.34", 300)},
+	}}
+	outObserve := &scriptedHandle{steps: []recvStep{
+		{delay: time.Millisecond, packet: makeIPv4TCPPacketWithSeqAck([4]byte{10, 0, 0, 2}, [4]byte{93, 184, 216, 34}, 50000, 443, 1, 1, 0x10, nil)},
+		{delay: time.Millisecond, packet: outboundClientHelloPacketToWithSeq("93.184.216.34", firstPayloadSeq, "www.example.com")},
+		{delay: time.Millisecond, packet: outboundTLSPacketToWithSeq("93.184.216.34", secondPayloadSeq)},
+	}}
+	blocker := &scriptedHandle{steps: []recvStep{
+		{packet: outboundTLSPacketToWithSeq("93.184.216.34", thirdPayloadSeq)},
+	}}
+	factoryCalls := 0
+	factory := func(key session.Key) (packetHandle, error) {
+		factoryCalls++
+		return blocker, nil
+	}
+
+	if err := runHostMatchLoopWithHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, &scriptedHandle{}, dnsObserve, factory); err != nil {
+		t.Fatalf("runHostMatchLoopWithHandles returned error: %v", err)
+	}
+	if factoryCalls != 1 {
+		t.Fatalf("expected blocker to be created exactly once after deferred DNS match, got %d", factoryCalls)
+	}
+	if len(blocker.sent) != 1 {
+		t.Fatalf("expected blocker to capture only the payload after deferred creation, got %d sends", len(blocker.sent))
+	}
+	if got := blocker.sent[0].packet[45]; got != 0x55 {
+		t.Fatalf("expected deferred blocker to mutate the first captured application-data packet, got 0x%02x", got)
+	}
+}
+
+func TestHostMatchBothModeDoesNotDeferBlockAfterDNSThenSNI(t *testing.T) {
+	cfg := config.Config{
+		TargetHost:      "www.example.com",
+		TargetPort:      443,
+		ObserveTimeout:  50 * time.Millisecond,
+		MutateOffset:    0,
+		MutateDirection: "both",
+		HostMatch:       "both",
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	store := session.NewStore(time.Now)
+	dnsCache := dnscache.New(cfg.TargetHost, time.Now)
+	processDNSObserve(cfg, logger, dnsCache, dnsResponsePacketForCaptureTest("www.example.com", "93.184.216.34", 300))
+
+	result, err := processHostOnlyObservedOutbound(cfg, logger, store, dnsCache, outboundClientHelloPacketToWithSeq("93.184.216.34", 1, "www.example.com"))
+	if err != nil {
+		t.Fatalf("processHostOnlyObservedOutbound returned error: %v", err)
+	}
+	if !result.matched || !result.canBlockOut {
+		t.Fatalf("expected both-mode DNS+SNI packet to be matched and具备出站阻断条件, got %+v", result)
+	}
+	if result.deferBlockOut {
+		t.Fatalf("expected both-mode DNS+SNI packet not to defer出站阻断创建")
+	}
+	if result.canBlockIn {
+		t.Fatalf("expected both-mode DNS+SNI packet not to arm inbound blocker before outbound application data, got %+v", result)
+	}
+}
+
+func TestHostMatchSNIModeIgnoresDNSResponse(t *testing.T) {
+	cfg := config.Config{
+		TargetHost:      "www.example.com",
+		TargetPort:      443,
+		ObserveTimeout:  50 * time.Millisecond,
+		MutateOffset:    0,
+		MutateDirection: "out",
+		HostMatch:       "sni",
+	}
+	dnsObserve := &scriptedHandle{steps: []recvStep{{packet: dnsResponsePacketForCaptureTest("www.example.com", "93.184.216.34", 300)}}}
+	outObserve := &scriptedHandle{steps: []recvStep{{delay: time.Millisecond, packet: outboundTLSPacketTo("93.184.216.34")}}}
+	factoryCalls := 0
+	factory := func(key session.Key) (packetHandle, error) {
+		factoryCalls++
+		return &scriptedHandle{}, nil
+	}
+
+	if err := runHostMatchLoopWithHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, &scriptedHandle{}, dnsObserve, factory); err != nil {
+		t.Fatalf("runHostMatchLoopWithHandles returned error: %v", err)
+	}
+	if factoryCalls != 0 {
+		t.Fatalf("expected sni mode to ignore DNS cache, got %d blocker calls", factoryCalls)
+	}
+}
+
+func TestHostMatchBothModeKeepsMatchedWhenDNSHitsBeforeDifferentSNI(t *testing.T) {
+	cfg := config.Config{
+		TargetHost:      "www.example.com",
+		TargetPort:      443,
+		ObserveTimeout:  50 * time.Millisecond,
+		MutateOffset:    0,
+		MutateDirection: "out",
+		HostMatch:       "both",
+	}
+
+	dnsObserve := &scriptedHandle{steps: []recvStep{
+		{packet: dnsResponsePacketForCaptureTest("www.example.com", "93.184.216.34", 300)},
+	}}
+	outObserve := &scriptedHandle{steps: []recvStep{
+		{delay: time.Millisecond, packet: outboundClientHelloPacketTo("93.184.216.34", "other.example.com")},
+	}}
+	blocker := &scriptedHandle{steps: []recvStep{
+		{packet: outboundTLSPacketTo("93.184.216.34")},
+	}}
+	factoryCalls := 0
+	factory := func(key session.Key) (packetHandle, error) {
+		factoryCalls++
+		return blocker, nil
+	}
+
+	if err := runHostMatchLoopWithHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, &scriptedHandle{}, dnsObserve, factory); err != nil {
+		t.Fatalf("runHostMatchLoopWithHandles returned error: %v", err)
+	}
+	if factoryCalls != 1 {
+		t.Fatalf("expected DNS-first both mode to keep matched connection, got %d blocker calls", factoryCalls)
+	}
+	if len(blocker.sent) != 1 {
+		t.Fatalf("expected blocker to reinject one packet, got %d", len(blocker.sent))
+	}
+	if got := blocker.sent[0].packet[45]; got != 0x55 {
+		t.Fatalf("expected blocker to mutate DNS-first mismatched-SNI connection, got 0x%02x", got)
+	}
+}
+
+func TestHostMatchBothLogsConflictWhenDNSMatchesButSNIDiffers(t *testing.T) {
+	cfg := config.Config{
+		TargetHost:      "www.example.com",
+		TargetPort:      443,
+		ObserveTimeout:  50 * time.Millisecond,
+		MutateOffset:    0,
+		MutateDirection: "out",
+		HostMatch:       "both",
+	}
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	dnsObserve := &scriptedHandle{steps: []recvStep{{packet: dnsResponsePacketForCaptureTest("www.example.com", "93.184.216.34", 300)}}}
+	outObserve := &scriptedHandle{steps: []recvStep{{delay: time.Millisecond, packet: outboundClientHelloPacketTo("93.184.216.34", "other.example")}}}
+	blocker := &scriptedHandle{steps: []recvStep{{packet: outboundTLSPacketTo("93.184.216.34")}}}
+	factory := func(key session.Key) (packetHandle, error) { return blocker, nil }
+
+	if err := runHostMatchLoopWithHandles(context.Background(), cfg, logger, outObserve, &scriptedHandle{}, dnsObserve, factory); err != nil {
+		t.Fatalf("runHostMatchLoopWithHandles returned error: %v", err)
+	}
+
+	logOutput := logs.String()
+	for _, want := range []string{
+		"DNS 命中目标连接但 SNI 不同",
+		"target_host=www.example.com",
+		"observed_host=other.example",
+		"matched_ip=93.184.216.34",
+	} {
+		if !strings.Contains(logOutput, want) {
+			t.Fatalf("expected conflict log to include %q, got: %s", want, logOutput)
+		}
+	}
+	if !regexp.MustCompile(`trace_id=t\d{6}`).MatchString(logOutput) {
+		t.Fatalf("expected conflict log to include trace_id, got: %s", logOutput)
+	}
+}
+
+func TestHostMatchBothModeDoesNotResurrectSNIExcludedConnectionFromDNS(t *testing.T) {
+	cfg := config.Config{
+		TargetHost:      "www.example.com",
+		TargetPort:      443,
+		ObserveTimeout:  50 * time.Millisecond,
+		MutateOffset:    0,
+		MutateDirection: "out",
+		HostMatch:       "both",
+	}
+
+	outObserve := &scriptedHandle{steps: []recvStep{
+		{packet: outboundClientHelloPacketTo("93.184.216.34", "other.example.com")},
+		{delay: 2 * time.Millisecond, packet: outboundTLSPacketTo("93.184.216.34")},
+	}}
+	dnsObserve := &scriptedHandle{steps: []recvStep{
+		{delay: time.Millisecond, packet: dnsResponsePacketForCaptureTest("www.example.com", "93.184.216.34", 300)},
+	}}
+	factoryCalls := 0
+	factory := func(key session.Key) (packetHandle, error) {
+		factoryCalls++
+		return &scriptedHandle{}, nil
+	}
+
+	if err := runHostMatchLoopWithHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, &scriptedHandle{}, dnsObserve, factory); err != nil {
+		t.Fatalf("runHostMatchLoopWithHandles returned error: %v", err)
+	}
+	if factoryCalls != 0 {
+		t.Fatalf("expected SNI excluded connection not to be resurrected by DNS, got %d blocker calls", factoryCalls)
+	}
+}
+
 func TestDynamicHostOnlyModeMutatesInboundThroughDedicatedBlocker(t *testing.T) {
 	cfg := config.Config{
 		TargetHost:      "example.com",
@@ -163,9 +660,11 @@ func TestDynamicHostOnlyModeMutatesInboundThroughDedicatedBlocker(t *testing.T) 
 	}
 
 	hello := outboundClientHelloPacket("example.com")
+	appSeq := uint32(len(hello) - 40 + len(buildClientHelloPayload("example.com")))
 	outObserve := &scriptedHandle{steps: []recvStep{
 		{packet: hello},
-		{delay: 20 * time.Millisecond, packet: outboundFINPacketWithSeq(uint32(len(hello) - 40))},
+		{delay: 5 * time.Millisecond, packet: outboundTLSPacketWithSeq(appSeq)},
+		{delay: 20 * time.Millisecond, packet: outboundFINPacketWithSeq(appSeq + 9)},
 	}}
 	inObserve := &scriptedHandle{steps: []recvStep{
 		{delay: 5 * time.Millisecond, packet: inboundApplicationDataPacketWithSeq(1000, []byte{0x17, 0x03, 0x03, 0x00, 0x04, 0xaa, 0xbb, 0xcc, 0xdd})},
@@ -179,7 +678,7 @@ func TestDynamicHostOnlyModeMutatesInboundThroughDedicatedBlocker(t *testing.T) 
 		return blocker, nil
 	}
 
-	if err := runHostMatchLoopWithHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, inObserve, factory); err != nil {
+	if err := runHostMatchLoopWithHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, inObserve, nil, factory); err != nil {
 		t.Fatalf("runHostMatchLoopWithHandles returned error: %v", err)
 	}
 
@@ -200,6 +699,87 @@ func TestDynamicHostOnlyModeMutatesInboundThroughDedicatedBlocker(t *testing.T) 
 	}
 }
 
+func TestDynamicHostOnlyInboundModeDefersBlockerUntilOutboundApplicationData(t *testing.T) {
+	cfg := config.Config{
+		TargetHost:      "example.com",
+		TargetPort:      443,
+		ObserveTimeout:  50 * time.Millisecond,
+		MutateOffset:    0,
+		MutateDirection: "in",
+	}
+
+	hello := outboundClientHelloPacket("example.com")
+	helloSeq := uint32(len(hello) - 40)
+	appSeq := helloSeq + uint32(len(buildClientHelloPayload("example.com")))
+	appDelivered := false
+	outObserve := &scriptedHandle{steps: []recvStep{
+		{packet: hello},
+		{delay: 5 * time.Millisecond, packet: outboundTLSPacketWithSeq(appSeq), onDeliver: func() { appDelivered = true }},
+	}}
+	inObserve := &scriptedHandle{}
+	inboundBlocker := &scriptedHandle{steps: []recvStep{
+		{delay: 5 * time.Millisecond, packet: inboundApplicationDataPacketWithSeq(1000, []byte{0x17, 0x03, 0x03, 0x00, 0x04, 0xaa, 0xbb, 0xcc, 0xdd})},
+	}}
+
+	factoryCalls := 0
+	factory := func(key session.Key) (packetHandle, error) {
+		factoryCalls++
+		if !appDelivered {
+			t.Fatal("expected inbound blocker creation to wait until outbound application data is observed")
+		}
+		if factoryCalls != 1 {
+			t.Fatalf("expected exactly one inbound blocker creation, got call %d", factoryCalls)
+		}
+		return inboundBlocker, nil
+	}
+
+	if err := runHostMatchLoopWithHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, inObserve, nil, factory); err != nil {
+		t.Fatalf("runHostMatchLoopWithHandles returned error: %v", err)
+	}
+
+	if factoryCalls != 1 {
+		t.Fatalf("expected inbound blocker to be created after outbound application data, got %d", factoryCalls)
+	}
+	if len(inboundBlocker.sent) != 1 {
+		t.Fatalf("expected deferred inbound blocker to reinject one packet, got %d", len(inboundBlocker.sent))
+	}
+	if got := inboundBlocker.sent[0].packet[45]; got != 0x55 {
+		t.Fatalf("expected deferred inbound blocker to mutate ciphertext byte to 0x55, got 0x%02x", got)
+	}
+}
+
+func TestHostOnlyInboundModeDoesNotStartObservationBeforeInboundMutation(t *testing.T) {
+	cfg := config.Config{
+		TargetHost:      "example.com",
+		TargetPort:      443,
+		ObserveTimeout:  10 * time.Millisecond,
+		MutateOffset:    0,
+		MutateDirection: "in",
+		HostMatch:       "sni",
+	}
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	hello := outboundClientHelloPacket("example.com")
+	appSeq := uint32(len(hello) - 40 + len(buildClientHelloPayload("example.com")))
+	outObserve := &scriptedHandle{steps: []recvStep{
+		{packet: hello},
+		{delay: 2 * time.Millisecond, packet: outboundTLSPacketWithSeq(appSeq)},
+	}}
+	factory := func(key session.Key) (packetHandle, error) {
+		return &scriptedHandle{}, nil
+	}
+
+	if err := runHostMatchLoopWithHandles(context.Background(), cfg, logger, outObserve, &scriptedHandle{}, nil, factory); err != nil {
+		t.Fatalf("runHostMatchLoopWithHandles returned error: %v", err)
+	}
+
+	logOutput := logs.String()
+	if strings.Contains(logOutput, "msg=连接观察结果") {
+		t.Fatalf("expected inbound-only matched connection not to start observation before mutation, got: %s", logOutput)
+	}
+}
+
 func TestDynamicHostOnlyModeMutatesThroughBidirectionalBlocker(t *testing.T) {
 	cfg := config.Config{
 		TargetHost:      "example.com",
@@ -210,35 +790,172 @@ func TestDynamicHostOnlyModeMutatesThroughBidirectionalBlocker(t *testing.T) {
 	}
 
 	hello := outboundClientHelloPacket("example.com")
-	outObserve := &scriptedHandle{steps: []recvStep{
-		{packet: hello},
-	}}
+	helloSeq := uint32(len(hello) - 40)
+	appSeq := helloSeq + uint32(len(buildClientHelloPayload("example.com")))
+	outObserve := &scriptedHandle{steps: []recvStep{{packet: hello}}}
 	inObserve := &scriptedHandle{}
-	blocker := &scriptedHandle{steps: []recvStep{
-		{packet: outboundTLSPacketWithSeq(uint32(len(hello) - 40))},
+	outboundBlocker := &scriptedHandle{steps: []recvStep{
+		{packet: outboundTLSPacketWithSeq(appSeq)},
+	}}
+	inboundBlocker := &scriptedHandle{steps: []recvStep{
 		{packet: inboundApplicationDataPacketWithSeq(1000, []byte{0x17, 0x03, 0x03, 0x00, 0x04, 0xaa, 0xbb, 0xcc, 0xdd})},
 	}}
 	factoryCalls := 0
 	factory := func(key session.Key) (packetHandle, error) {
 		factoryCalls++
-		return blocker, nil
+		if factoryCalls == 1 {
+			return outboundBlocker, nil
+		}
+		if factoryCalls == 2 {
+			return inboundBlocker, nil
+		}
+		t.Fatalf("unexpected extra blocker creation: %d", factoryCalls)
+		return nil, nil
 	}
 
-	if err := runHostMatchLoopWithHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, inObserve, factory); err != nil {
+	if err := runHostMatchLoopWithHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, inObserve, nil, factory); err != nil {
 		t.Fatalf("runHostMatchLoopWithHandles returned error: %v", err)
 	}
 
-	if factoryCalls != 1 {
-		t.Fatalf("expected one bidirectional blocker, got %d", factoryCalls)
+	if factoryCalls != 2 {
+		t.Fatalf("expected separate outbound and inbound blockers, got %d", factoryCalls)
 	}
-	if len(blocker.sent) != 2 {
-		t.Fatalf("expected bidirectional blocker to reinject two packets, got %d", len(blocker.sent))
+	if len(outboundBlocker.sent) != 1 {
+		t.Fatalf("expected outbound blocker to reinject one packet, got %d", len(outboundBlocker.sent))
 	}
-	if got := blocker.sent[0].packet[45]; got != 0x55 {
+	if len(inboundBlocker.sent) != 1 {
+		t.Fatalf("expected inbound blocker to reinject one packet, got %d", len(inboundBlocker.sent))
+	}
+	if got := outboundBlocker.sent[0].packet[45]; got != 0x55 {
 		t.Fatalf("expected outbound packet to be mutated by bidirectional blocker, got 0x%02x", got)
 	}
-	if got := blocker.sent[1].packet[45]; got != 0x55 {
+	if got := inboundBlocker.sent[0].packet[45]; got != 0x55 {
 		t.Fatalf("expected inbound packet to be mutated by bidirectional blocker, got 0x%02x", got)
+	}
+}
+
+func TestDynamicHostOnlyBothModeUsesSeparateOutboundAndInboundBlockers(t *testing.T) {
+	cfg := config.Config{
+		TargetHost:      "example.com",
+		TargetPort:      443,
+		ObserveTimeout:  50 * time.Millisecond,
+		MutateOffset:    0,
+		MutateDirection: "both",
+	}
+
+	hello := outboundClientHelloPacket("example.com")
+	helloSeq := uint32(len(hello) - 40)
+	appSeq := helloSeq + uint32(len(buildClientHelloPayload("example.com")))
+	outObserve := &scriptedHandle{steps: []recvStep{
+		{packet: hello},
+	}}
+	inObserve := &scriptedHandle{}
+	outboundBlocker := &scriptedHandle{steps: []recvStep{
+		{delay: 5 * time.Millisecond, packet: outboundTLSPacketWithSeq(appSeq)},
+	}}
+	inboundBlocker := &scriptedHandle{steps: []recvStep{
+		{delay: 10 * time.Millisecond, packet: inboundApplicationDataPacketWithSeq(1000, []byte{0x17, 0x03, 0x03, 0x00, 0x04, 0xaa, 0xbb, 0xcc, 0xdd})},
+	}}
+
+	factoryCalls := 0
+	factory := func(key session.Key) (packetHandle, error) {
+		factoryCalls++
+		switch factoryCalls {
+		case 1:
+			return outboundBlocker, nil
+		case 2:
+			return inboundBlocker, nil
+		default:
+			t.Fatalf("unexpected extra blocker creation: %d", factoryCalls)
+			return nil, nil
+		}
+	}
+
+	if err := runHostMatchLoopWithHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, inObserve, nil, factory); err != nil {
+		t.Fatalf("runHostMatchLoopWithHandles returned error: %v", err)
+	}
+
+	if factoryCalls != 2 {
+		t.Fatalf("expected both mode to create separate outbound and inbound blockers, got %d", factoryCalls)
+	}
+	if len(outboundBlocker.sent) != 1 {
+		t.Fatalf("expected outbound blocker to reinject one packet, got %d", len(outboundBlocker.sent))
+	}
+	if len(inboundBlocker.sent) != 1 {
+		t.Fatalf("expected inbound blocker to reinject one packet, got %d", len(inboundBlocker.sent))
+	}
+	if got := outboundBlocker.sent[0].packet[45]; got != 0x55 {
+		t.Fatalf("expected outbound blocker to mutate ciphertext byte to 0x55, got 0x%02x", got)
+	}
+	if got := inboundBlocker.sent[0].packet[45]; got != 0x55 {
+		t.Fatalf("expected inbound blocker to mutate ciphertext byte to 0x55, got 0x%02x", got)
+	}
+}
+
+func TestHostOnlyBothModeMutatesThroughStaticBlockHandles(t *testing.T) {
+	cfg := config.Config{
+		TargetHost:      "example.com",
+		TargetPort:      443,
+		ObserveTimeout:  50 * time.Millisecond,
+		MutateOffset:    0,
+		MutateDirection: "both",
+		HostMatch:       "sni",
+	}
+
+	outObserve := &scriptedHandle{steps: []recvStep{
+		{packet: outboundClientHelloPacket("example.com")},
+	}}
+	inObserve := &scriptedHandle{}
+	outBlock := &scriptedHandle{steps: []recvStep{
+		{delay: 5 * time.Millisecond, packet: outboundTLSPacketWithSeq(uint32(len(buildClientHelloPayload("example.com"))))},
+	}}
+	inBlock := &scriptedHandle{steps: []recvStep{
+		{delay: 5 * time.Millisecond, packet: inboundApplicationDataPacketWithSeq(1000, []byte{0x17, 0x03, 0x03, 0x00, 0x04, 0xaa, 0xbb, 0xcc, 0xdd})},
+	}}
+
+	if err := runHostMatchLoopWithStaticHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, inObserve, nil, outBlock, inBlock, nil, nil); err != nil {
+		t.Fatalf("runHostMatchLoopWithStaticHandles returned error: %v", err)
+	}
+	if len(outBlock.sent) != 1 {
+		t.Fatalf("expected static outbound blocker to reinject one packet, got %d", len(outBlock.sent))
+	}
+	if len(inBlock.sent) != 1 {
+		t.Fatalf("expected static inbound blocker to reinject one packet, got %d", len(inBlock.sent))
+	}
+	if got := outBlock.sent[0].packet[45]; got != 0x55 {
+		t.Fatalf("expected static outbound blocker to mutate ciphertext byte to 0x55, got 0x%02x", got)
+	}
+	if got := inBlock.sent[0].packet[45]; got != 0x55 {
+		t.Fatalf("expected static inbound blocker to mutate ciphertext byte to 0x55, got 0x%02x", got)
+	}
+}
+
+func TestHostOnlyInModeMutatesInboundThroughStaticBlockHandle(t *testing.T) {
+	cfg := config.Config{
+		TargetHost:      "example.com",
+		TargetPort:      443,
+		ObserveTimeout:  50 * time.Millisecond,
+		MutateOffset:    0,
+		MutateDirection: "in",
+		HostMatch:       "sni",
+	}
+
+	outObserve := &scriptedHandle{steps: []recvStep{
+		{packet: outboundClientHelloPacket("example.com")},
+	}}
+	inObserve := &scriptedHandle{}
+	inBlock := &scriptedHandle{steps: []recvStep{
+		{delay: 5 * time.Millisecond, packet: inboundApplicationDataPacketWithSeq(1000, []byte{0x17, 0x03, 0x03, 0x00, 0x04, 0xaa, 0xbb, 0xcc, 0xdd})},
+	}}
+
+	if err := runHostMatchLoopWithStaticHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, inObserve, nil, nil, inBlock, nil, nil); err != nil {
+		t.Fatalf("runHostMatchLoopWithStaticHandles returned error: %v", err)
+	}
+	if len(inBlock.sent) != 1 {
+		t.Fatalf("expected static inbound blocker to reinject one packet, got %d", len(inBlock.sent))
+	}
+	if got := inBlock.sent[0].packet[45]; got != 0x55 {
+		t.Fatalf("expected static inbound blocker to mutate ciphertext byte to 0x55, got 0x%02x", got)
 	}
 }
 
@@ -252,8 +969,10 @@ func TestHostOnlyInboundBlockerHandlesTerminalPacketBeforeSniffCleanup(t *testin
 	}
 
 	hello := outboundClientHelloPacket("example.com")
+	appSeq := uint32(len(hello) - 40 + len(buildClientHelloPayload("example.com")))
 	outObserve := &scriptedHandle{steps: []recvStep{
 		{packet: hello},
+		{delay: 2 * time.Millisecond, packet: outboundTLSPacketWithSeq(appSeq)},
 	}}
 	terminalPacket := inboundFINApplicationDataPacketWithSeq(1000, []byte{0x17, 0x03, 0x03, 0x00, 0x04, 0xaa, 0xbb, 0xcc, 0xdd})
 	inObserve := &scriptedHandle{steps: []recvStep{
@@ -266,7 +985,7 @@ func TestHostOnlyInboundBlockerHandlesTerminalPacketBeforeSniffCleanup(t *testin
 		return blocker, nil
 	}
 
-	if err := runHostMatchLoopWithHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, inObserve, factory); err != nil {
+	if err := runHostMatchLoopWithHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, inObserve, nil, factory); err != nil {
 		t.Fatalf("runHostMatchLoopWithHandles returned error: %v", err)
 	}
 
@@ -310,7 +1029,7 @@ func TestHostOnlyMatchedConnectionMutatesMultipleApplicationDataRounds(t *testin
 		return blocker, nil
 	}
 
-	if err := runHostMatchLoopWithHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, inObserve, factory); err != nil {
+	if err := runHostMatchLoopWithHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, inObserve, nil, factory); err != nil {
 		t.Fatalf("runHostMatchLoopWithHandles returned error: %v", err)
 	}
 	if factoryCalls != 1 {
@@ -351,7 +1070,7 @@ func TestHostOnlyMatchedConnectionLogsMultipleObservationResultsWithSameTraceID(
 	}}
 	factory := func(key session.Key) (packetHandle, error) { return blocker, nil }
 
-	if err := runHostMatchLoopWithHandles(context.Background(), cfg, logger, outObserve, inObserve, factory); err != nil {
+	if err := runHostMatchLoopWithHandles(context.Background(), cfg, logger, outObserve, inObserve, nil, factory); err != nil {
 		t.Fatalf("runHostMatchLoopWithHandles returned error: %v", err)
 	}
 
@@ -443,7 +1162,7 @@ func TestHostOnlyMatchedConnectionMutatesAgainAfterAlertRoundWithSameTraceID(t *
 	}}
 	factory := func(key session.Key) (packetHandle, error) { return blocker, nil }
 
-	if err := runHostMatchLoopWithHandles(context.Background(), cfg, logger, outObserve, inObserve, factory); err != nil {
+	if err := runHostMatchLoopWithHandles(context.Background(), cfg, logger, outObserve, inObserve, nil, factory); err != nil {
 		t.Fatalf("runHostMatchLoopWithHandles returned error: %v", err)
 	}
 
@@ -467,6 +1186,132 @@ func TestHostOnlyMatchedConnectionMutatesAgainAfterAlertRoundWithSameTraceID(t *
 	resultMatches := regexp.MustCompile(`msg=连接观察结果[^\n]*trace_id=(t\d{6})`).FindAllStringSubmatch(logOutput, -1)
 	if len(resultMatches) < 2 || resultMatches[0][1] != resultMatches[1][1] {
 		t.Fatalf("expected alert round and later round to reuse same trace id, got: %v", resultMatches)
+	}
+}
+
+func TestHostOnlyInboundRetransmittedMutatedPacketBecomesProbableFailure(t *testing.T) {
+	cfg := config.Config{
+		TargetHost:      "example.com",
+		TargetPort:      443,
+		ObserveTimeout:  10 * time.Millisecond,
+		MutateOffset:    0,
+		MutateDirection: "in",
+	}
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+
+	hello := outboundClientHelloPacket("example.com")
+	appSeq := uint32(len(hello) - 40 + len(buildClientHelloPayload("example.com")))
+	outObserve := &scriptedHandle{steps: []recvStep{
+		{packet: hello},
+		{delay: 2 * time.Millisecond, packet: outboundTLSPacketWithSeq(appSeq)},
+	}}
+	inObserve := &scriptedHandle{}
+	firstFragment := inboundApplicationDataPacketWithSeq(1000, []byte{0x17, 0x03, 0x03, 0x00, 0x04, 0xaa, 0xbb})
+	tailFragment := inboundApplicationDataPacketWithSeq(1007, []byte{0xcc, 0xdd})
+	blocker := &scriptedHandle{steps: []recvStep{
+		{delay: 2 * time.Millisecond, packet: firstFragment},
+		{delay: 2 * time.Millisecond, packet: tailFragment},
+		{delay: 2 * time.Millisecond, packet: firstFragment},
+		{delay: 20 * time.Millisecond, packet: firstFragment},
+	}}
+	factory := func(key session.Key) (packetHandle, error) { return blocker, nil }
+
+	if err := runHostMatchLoopWithHandles(context.Background(), cfg, logger, outObserve, inObserve, nil, factory); err != nil {
+		t.Fatalf("runHostMatchLoopWithHandles returned error: %v", err)
+	}
+
+	logOutput := logs.String()
+	if !strings.Contains(logOutput, "outcome=probable_failure") {
+		t.Fatalf("expected retransmitted inbound mutation to become probable_failure, got: %s", logOutput)
+	}
+	if !strings.Contains(logOutput, "reason=retransmit") {
+		t.Fatalf("expected retransmitted inbound mutation to log reason=retransmit, got: %s", logOutput)
+	}
+}
+
+func TestHostOnlyOutboundActivityRefreshesInboundObservationWindow(t *testing.T) {
+	cfg := config.Config{
+		TargetHost:      "example.com",
+		TargetPort:      443,
+		ObserveTimeout:  20 * time.Millisecond,
+		MutateOffset:    0,
+		MutateDirection: "in",
+	}
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+
+	hello := outboundClientHelloPacket("example.com")
+	appSeq := uint32(len(hello) - 40 + len(buildClientHelloPayload("example.com")))
+	outObserve := &scriptedHandle{steps: []recvStep{
+		{packet: hello},
+		{delay: 2 * time.Millisecond, packet: outboundTLSPacketWithSeq(appSeq)},
+		{delay: 15 * time.Millisecond, packet: outboundAckPacket(1011)},
+	}}
+	inObserve := &scriptedHandle{}
+	blocker := &scriptedHandle{steps: []recvStep{
+		{delay: 2 * time.Millisecond, packet: inboundApplicationDataPacketWithSeq(1000, []byte{0x17, 0x03, 0x03, 0x00, 0x04, 0xaa, 0xbb, 0xcc, 0xdd})},
+		{delay: 25 * time.Millisecond, packet: inboundRSTPacket()},
+	}}
+	factory := func(key session.Key) (packetHandle, error) { return blocker, nil }
+
+	if err := runHostMatchLoopWithHandles(context.Background(), cfg, logger, outObserve, inObserve, nil, factory); err != nil {
+		t.Fatalf("runHostMatchLoopWithHandles returned error: %v", err)
+	}
+
+	logOutput := logs.String()
+	if strings.Contains(logOutput, "outcome=no_conclusion") {
+		t.Fatalf("expected outbound activity to refresh inbound observation window before late RST, got: %s", logOutput)
+	}
+	if !strings.Contains(logOutput, "outcome=definite_failure") {
+		t.Fatalf("expected late inbound RST to be classified after refreshed observation window, got: %s", logOutput)
+	}
+	if !strings.Contains(logOutput, "direction=in") {
+		t.Fatalf("expected refreshed result to preserve direction=in, got: %s", logOutput)
+	}
+}
+
+func TestHostOnlyInboundGraceSuppressesEarlyTimeoutBeforeRetransmit(t *testing.T) {
+	cfg := config.Config{
+		TargetHost:      "example.com",
+		TargetPort:      443,
+		ObserveTimeout:  20 * time.Millisecond,
+		MutateOffset:    0,
+		MutateDirection: "in",
+	}
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+
+	hello := outboundClientHelloPacket("example.com")
+	appSeq := uint32(len(hello) - 40 + len(buildClientHelloPayload("example.com")))
+	outObserve := &scriptedHandle{steps: []recvStep{
+		{packet: hello},
+		{delay: 2 * time.Millisecond, packet: outboundTLSPacketWithSeq(appSeq)},
+	}}
+	inObserve := &scriptedHandle{}
+	packet := inboundApplicationDataPacketWithSeq(1000, []byte{0x17, 0x03, 0x03, 0x00, 0x04, 0xaa, 0xbb, 0xcc, 0xdd})
+	blocker := &scriptedHandle{steps: []recvStep{
+		{delay: 2 * time.Millisecond, packet: packet},
+		{delay: 25 * time.Millisecond, packet: packet},
+	}}
+	factory := func(key session.Key) (packetHandle, error) { return blocker, nil }
+
+	if err := runHostMatchLoopWithHandles(context.Background(), cfg, logger, outObserve, inObserve, nil, factory); err != nil {
+		t.Fatalf("runHostMatchLoopWithHandles returned error: %v", err)
+	}
+
+	logOutput := logs.String()
+	if strings.Contains(logOutput, "outcome=no_conclusion") {
+		t.Fatalf("expected inbound grace round to suppress premature timeout before retransmit, got: %s", logOutput)
+	}
+	if !strings.Contains(logOutput, "outcome=probable_failure") {
+		t.Fatalf("expected delayed retransmit to be classified as probable_failure, got: %s", logOutput)
+	}
+	if !strings.Contains(logOutput, "reason=retransmit") {
+		t.Fatalf("expected delayed retransmit to log reason=retransmit, got: %s", logOutput)
 	}
 }
 
@@ -508,7 +1353,7 @@ func TestHostOnlyTerminalCleanupClosesBlockerAndReleasesConnectionState(t *testi
 		return handle, nil
 	}
 
-	if err := runHostMatchLoopWithHandles(context.Background(), cfg, logger, outObserve, inObserve, factory); err != nil {
+	if err := runHostMatchLoopWithHandles(context.Background(), cfg, logger, outObserve, inObserve, nil, factory); err != nil {
 		t.Fatalf("runHostMatchLoopWithHandles returned error: %v", err)
 	}
 
@@ -554,7 +1399,7 @@ func TestHostOnlyRetainsConnectionAfterLongTimeoutSilence(t *testing.T) {
 	}}
 	factory := func(key session.Key) (packetHandle, error) { return blocker, nil }
 
-	if err := runHostMatchLoopWithHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, inObserve, factory); err != nil {
+	if err := runHostMatchLoopWithHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, inObserve, nil, factory); err != nil {
 		t.Fatalf("runHostMatchLoopWithHandles returned error: %v", err)
 	}
 
@@ -586,7 +1431,7 @@ func TestHostOnlyRetainsConnectionAfterLongAlertSilence(t *testing.T) {
 	}}
 	factory := func(key session.Key) (packetHandle, error) { return blocker, nil }
 
-	if err := runHostMatchLoopWithHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, inObserve, factory); err != nil {
+	if err := runHostMatchLoopWithHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, inObserve, nil, factory); err != nil {
 		t.Fatalf("runHostMatchLoopWithHandles returned error: %v", err)
 	}
 
@@ -621,7 +1466,7 @@ func TestHostOnlyHalfCloseCleanupClosesBlockerAfterSingleFINSilence(t *testing.T
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
-	if err := runHostMatchLoopWithHandles(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, inObserve, factory); err != nil {
+	if err := runHostMatchLoopWithHandles(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, inObserve, nil, factory); err != nil {
 		t.Fatalf("runHostMatchLoopWithHandles returned error: %v", err)
 	}
 
@@ -640,10 +1485,11 @@ func TestHostOnlyHalfCloseTrafficRefreshesCleanupDeadline(t *testing.T) {
 	}
 
 	hello := outboundClientHelloPacket("example.com")
-	firstSeq := uint32(len(hello) - 40)
+	appSeq := uint32(len(hello) - 40 + len(buildClientHelloPayload("example.com")))
 	outObserve := &scriptedHandle{steps: []recvStep{
 		{packet: hello},
-		{delay: 5 * time.Millisecond, packet: outboundFINPacketWithSeq(firstSeq)},
+		{delay: 5 * time.Millisecond, packet: outboundTLSPacketWithSeq(appSeq)},
+		{delay: 10 * time.Millisecond, packet: outboundFINPacketWithSeq(appSeq + 9)},
 	}}
 	inObserve := &scriptedHandle{}
 	blocker := &scriptedHandle{steps: []recvStep{
@@ -653,7 +1499,7 @@ func TestHostOnlyHalfCloseTrafficRefreshesCleanupDeadline(t *testing.T) {
 	}}
 	factory := func(key session.Key) (packetHandle, error) { return blocker, nil }
 
-	if err := runHostMatchLoopWithHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, inObserve, factory); err != nil {
+	if err := runHostMatchLoopWithHandles(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), outObserve, inObserve, nil, factory); err != nil {
 		t.Fatalf("runHostMatchLoopWithHandles returned error: %v", err)
 	}
 
@@ -1337,6 +2183,56 @@ func TestProcessInboundBlockerForwardsPureACK(t *testing.T) {
 	}
 }
 
+func TestProcessHostOnlyInboundPureACKDoesNotPoisonFutureApplicationDataMutation(t *testing.T) {
+	cfg := config.Config{
+		TargetHost:      "example.com",
+		TargetPort:      443,
+		ObserveTimeout:  50 * time.Millisecond,
+		MutateDirection: "in",
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	store := session.NewStore(time.Now)
+	handle := &fakeHandle{}
+	key := session.Key{
+		ClientIP:   "10.0.0.2",
+		ClientPort: 50000,
+		ServerIP:   "93.184.216.34",
+		ServerPort: 443,
+	}
+	store.MarkMatched(key)
+
+	ackResult, err := processHostOnlyInbound(logger, store, cfg, inboundAckPacket(1000), nil, handle, "in")
+	if err != nil {
+		t.Fatalf("processHostOnlyInbound returned error for pure ACK: %v", err)
+	}
+	if ackResult.mutated {
+		t.Fatal("expected pure ACK not to mutate payload")
+	}
+
+	result, err := processHostOnlyInbound(
+		logger,
+		store,
+		cfg,
+		inboundApplicationDataPacketWithSeq(1000, []byte{0x17, 0x03, 0x03, 0x00, 0x04, 0xaa, 0xbb, 0xcc, 0xdd}),
+		nil,
+		handle,
+		"in",
+	)
+	if err != nil {
+		t.Fatalf("processHostOnlyInbound returned error for application data: %v", err)
+	}
+	if !result.mutated {
+		t.Fatal("expected application data after pure ACK to still be mutated")
+	}
+	if len(handle.sent) != 2 {
+		t.Fatalf("expected ACK and application data to each be reinjected once, got %d sends", len(handle.sent))
+	}
+	if got := handle.sent[1].packet[45]; got != 0x55 {
+		t.Fatalf("expected inbound application data to be mutated after pure ACK, got 0x%02x", got)
+	}
+}
+
 func TestProcessInboundBlockerForwardsNonMutatedHandshakePacket(t *testing.T) {
 	cfg := config.Config{
 		TargetIP:        netip.MustParseAddr("93.184.216.34"),
@@ -1770,6 +2666,86 @@ func TestProcessBlockedOutboundSkipsStaleEventWhenHandleMissing(t *testing.T) {
 	}
 }
 
+func TestProcessHostOnlyBlockedOutboundMutatesApplicationDataWithLeadingNoise(t *testing.T) {
+	cfg := config.Config{
+		TargetHost:      "example.com",
+		TargetPort:      443,
+		ObserveTimeout:  5 * time.Second,
+		MutateOffset:    0,
+		MutateDirection: "both",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	store := session.NewStore(time.Now)
+	handle := &fakeHandle{}
+	key := session.Key{
+		ClientIP:   "10.0.0.2",
+		ClientPort: 50000,
+		ServerIP:   "93.184.216.34",
+		ServerPort: 443,
+	}
+	store.MarkMatched(key)
+
+	payload := append([]byte{0x88, 0x99, 0xaa}, []byte{0x17, 0x03, 0x03, 0x00, 0x04, 0xde, 0xad, 0xbe, 0xef}...)
+	packet := makeIPv4TCPPacketWithSeqAck(
+		[4]byte{10, 0, 0, 2},
+		[4]byte{93, 184, 216, 34},
+		50000,
+		443,
+		1000,
+		0,
+		0x18,
+		payload,
+	)
+
+	result, err := processHostOnlyBlockedOutbound(cfg, logger, store, key, packet, nil, handle, "out")
+	if err != nil {
+		t.Fatalf("processHostOnlyBlockedOutbound returned error: %v", err)
+	}
+	if !result.mutated {
+		t.Fatal("expected blocked outbound packet with leading-noise application data to be mutated")
+	}
+}
+
+func TestProcessHostOnlyInboundMutatesApplicationDataWithLeadingNoise(t *testing.T) {
+	cfg := config.Config{
+		TargetHost:      "example.com",
+		TargetPort:      443,
+		ObserveTimeout:  5 * time.Second,
+		MutateOffset:    0,
+		MutateDirection: "in",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	store := session.NewStore(time.Now)
+	key := session.Key{
+		ClientIP:   "10.0.0.2",
+		ClientPort: 50000,
+		ServerIP:   "93.184.216.34",
+		ServerPort: 443,
+	}
+	store.MarkMatched(key)
+
+	payload := append([]byte{0x42, 0x24}, []byte{0x17, 0x03, 0x03, 0x00, 0x04, 0xde, 0xad, 0xbe, 0xef}...)
+	packet := makeIPv4TCPPacketWithSeqAck(
+		[4]byte{93, 184, 216, 34},
+		[4]byte{10, 0, 0, 2},
+		443,
+		50000,
+		2000,
+		0,
+		0x18,
+		payload,
+	)
+	handle := &fakeHandle{}
+
+	result, err := processHostOnlyInbound(logger, store, cfg, packet, nil, handle, "in")
+	if err != nil {
+		t.Fatalf("processHostOnlyInbound returned error: %v", err)
+	}
+	if !result.mutated {
+		t.Fatal("expected blocked inbound packet with leading-noise application data to be mutated")
+	}
+}
+
 func TestRunLoopIgnoresAbortedIOFromClosedDynamicBlocker(t *testing.T) {
 	cfg := config.Config{
 		TargetHost:     "example.com",
@@ -1865,6 +2841,7 @@ type recvStep struct {
 	err             error
 	delay           time.Duration
 	blockUntilClose bool
+	onDeliver       func()
 }
 
 type scriptedHandle struct {
@@ -1905,6 +2882,9 @@ func (h *scriptedHandle) Recv() ([]byte, any, error) {
 	}
 	if step.err != nil {
 		return nil, nil, step.err
+	}
+	if step.onDeliver != nil {
+		step.onDeliver()
 	}
 	return append([]byte(nil), step.packet...), step.addr, nil
 }
@@ -2001,6 +2981,18 @@ func outboundTLSPacket() []byte {
 
 func outboundTLSPacketTo(dst string) []byte {
 	return outboundTLSPacketToWithSeq(dst, 0)
+}
+
+func dnsResponsePacketForCaptureTest(host, ip string, ttl uint32) []byte {
+	question := encodeDNSNameForCaptureTest(host)
+	question = append(question, 0x00, 0x01, 0x00, 0x01)
+	answer := []byte{0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, byte(ttl >> 24), byte(ttl >> 16), byte(ttl >> 8), byte(ttl), 0x00, 0x04}
+	as4 := netip.MustParseAddr(ip).As4()
+	answer = append(answer, as4[:]...)
+	dns := []byte{0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00}
+	dns = append(dns, question...)
+	dns = append(dns, answer...)
+	return ipv4UDPForCaptureTest([4]byte{8, 8, 8, 8}, [4]byte{10, 0, 0, 2}, 53, 53000, dns)
 }
 
 func outboundClientHelloPacket(serverName string) []byte {
@@ -2153,6 +3145,35 @@ func makeIPv4TCPPacketWithSeqAck(srcIP, dstIP [4]byte, srcPort, dstPort uint16, 
 	packet[33] = flags
 	copy(packet[40:], payload)
 	return packet
+}
+
+func ipv4UDPForCaptureTest(srcIP, dstIP [4]byte, srcPort, dstPort uint16, payload []byte) []byte {
+	const ipHeaderLen = 20
+	const udpHeaderLen = 8
+
+	packet := make([]byte, ipHeaderLen+udpHeaderLen+len(payload))
+	packet[0] = 0x45
+	packet[8] = 64
+	packet[9] = 17
+	copy(packet[12:16], srcIP[:])
+	copy(packet[16:20], dstIP[:])
+	binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
+	binary.BigEndian.PutUint16(packet[ipHeaderLen:ipHeaderLen+2], srcPort)
+	binary.BigEndian.PutUint16(packet[ipHeaderLen+2:ipHeaderLen+4], dstPort)
+	binary.BigEndian.PutUint16(packet[ipHeaderLen+4:ipHeaderLen+6], uint16(udpHeaderLen+len(payload)))
+	copy(packet[ipHeaderLen+udpHeaderLen:], payload)
+	return packet
+}
+
+func encodeDNSNameForCaptureTest(host string) []byte {
+	labels := strings.Split(strings.TrimSuffix(host, "."), ".")
+	buf := make([]byte, 0, len(host)+2)
+	for _, label := range labels {
+		buf = append(buf, byte(len(label)))
+		buf = append(buf, label...)
+	}
+	buf = append(buf, 0x00)
+	return buf
 }
 
 func outboundTLSPacketWithSeq(seq uint32) []byte {

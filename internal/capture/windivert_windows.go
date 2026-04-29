@@ -15,6 +15,8 @@ import (
 	"golang.org/x/sys/windows"
 
 	"tls-mitm/internal/config"
+	"tls-mitm/internal/dnscache"
+	"tls-mitm/internal/dnsmeta"
 	"tls-mitm/internal/mutate"
 	"tls-mitm/internal/reassembly"
 	"tls-mitm/internal/session"
@@ -44,6 +46,9 @@ type hostOnlyConnectionState struct {
 type hostOnlyEventResult struct {
 	key             session.Key
 	matched         bool
+	canBlockOut     bool
+	canBlockIn      bool
+	deferBlockOut   bool
 	observed        bool
 	mutated         bool
 	signal          session.Signal
@@ -113,7 +118,7 @@ func OpenObserveHandleWithPriority(filter string, priority int16) (*Handle, erro
 // BuildInboundConnectionFilter 为单条已命中的连接构造专用入站阻断过滤表达式。
 func BuildInboundConnectionFilter(key session.Key) string {
 	return fmt.Sprintf(
-		"(inbound and tcp and ip and ip.SrcAddr == %s and tcp.SrcPort == %d and ip.DstAddr == %s and tcp.DstPort == %d)",
+		"(inbound and tcp and ip and !impostor and ip.SrcAddr == %s and tcp.SrcPort == %d and ip.DstAddr == %s and tcp.DstPort == %d)",
 		key.ServerIP,
 		key.ServerPort,
 		key.ClientIP,
@@ -124,7 +129,7 @@ func BuildInboundConnectionFilter(key session.Key) string {
 // BuildBidirectionalConnectionFilter 为单条已命中的连接构造双向阻断过滤表达式。
 func BuildBidirectionalConnectionFilter(key session.Key) string {
 	return fmt.Sprintf(
-		"((outbound and tcp and ip and ip.SrcAddr == %s and tcp.SrcPort == %d and ip.DstAddr == %s and tcp.DstPort == %d) or (inbound and tcp and ip and ip.SrcAddr == %s and tcp.SrcPort == %d and ip.DstAddr == %s and tcp.DstPort == %d))",
+		"((outbound and tcp and ip and !impostor and ip.SrcAddr == %s and tcp.SrcPort == %d and ip.DstAddr == %s and tcp.DstPort == %d) or (inbound and tcp and ip and !impostor and ip.SrcAddr == %s and tcp.SrcPort == %d and ip.DstAddr == %s and tcp.DstPort == %d))",
 		key.ClientIP,
 		key.ClientPort,
 		key.ServerIP,
@@ -144,21 +149,109 @@ func RunHostMatchLoop(
 	outObserveHandle, inObserveHandle *Handle,
 	newBlockHandle func(key session.Key) (*Handle, error),
 ) error {
-	var factory blockerFactory
-	if newBlockHandle != nil {
-		factory = func(key session.Key) (packetHandle, error) {
+	return RunDomainMatchLoop(ctx, cfg, logger, outObserveHandle, inObserveHandle, nil, newBlockHandle)
+}
+
+// RunDomainMatchLoop 运行基于 SNI、DNS 或二者组合命中的“先观察、后阻断”主循环。
+func RunDomainMatchLoop(
+	ctx context.Context,
+	cfg config.Config,
+	logger *slog.Logger,
+	outObserveHandle, inObserveHandle, dnsObserveHandle *Handle,
+	newBlockHandle func(key session.Key) (*Handle, error),
+) error {
+	switch cfg.MutateDirection {
+	case mutationDirectionIn:
+		return RunDomainMatchLoopWithFactories(ctx, cfg, logger, outObserveHandle, inObserveHandle, dnsObserveHandle, nil, newBlockHandle)
+	case "both":
+		return RunDomainMatchLoopWithFactories(ctx, cfg, logger, outObserveHandle, inObserveHandle, dnsObserveHandle, newBlockHandle, newBlockHandle)
+	default:
+		return RunDomainMatchLoopWithFactories(ctx, cfg, logger, outObserveHandle, inObserveHandle, dnsObserveHandle, newBlockHandle, nil)
+	}
+}
+
+// RunDomainMatchLoopWithFactories 运行域名命中主循环，并允许分别注入出站和入站动态阻断句柄工厂。
+func RunDomainMatchLoopWithFactories(
+	ctx context.Context,
+	cfg config.Config,
+	logger *slog.Logger,
+	outObserveHandle, inObserveHandle, dnsObserveHandle *Handle,
+	newOutboundBlockHandle, newInboundBlockHandle func(key session.Key) (*Handle, error),
+) error {
+	var outboundFactory blockerFactory
+	if newOutboundBlockHandle != nil {
+		outboundFactory = func(key session.Key) (packetHandle, error) {
+			return newOutboundBlockHandle(key)
+		}
+	}
+	var inboundFactory blockerFactory
+	if newInboundBlockHandle != nil {
+		inboundFactory = func(key session.Key) (packetHandle, error) {
+			return newInboundBlockHandle(key)
+		}
+	}
+	return runHostMatchLoopWithStaticHandles(ctx, cfg, logger, outObserveHandle, inObserveHandle, dnsObserveHandle, nil, nil, outboundFactory, inboundFactory)
+}
+
+// RunDomainMatchLoopWithStatic 运行域名命中主循环，并允许注入静态阻断句柄。
+func RunDomainMatchLoopWithStatic(
+	ctx context.Context,
+	cfg config.Config,
+	logger *slog.Logger,
+	outObserveHandle, inObserveHandle, dnsObserveHandle, outBlockHandle, inBlockHandle *Handle,
+	newBlockHandle func(key session.Key) (*Handle, error),
+) error {
+	var outboundFactory blockerFactory
+	switch cfg.MutateDirection {
+	case mutationDirectionIn:
+		if newBlockHandle != nil {
+			outboundFactory = nil
+		}
+	case "both":
+		if newBlockHandle != nil {
+			outboundFactory = func(key session.Key) (packetHandle, error) {
+				return newBlockHandle(key)
+			}
+		}
+	default:
+		if newBlockHandle != nil {
+			outboundFactory = func(key session.Key) (packetHandle, error) {
+				return newBlockHandle(key)
+			}
+		}
+	}
+	var inboundFactory blockerFactory
+	if newBlockHandle != nil && (cfg.MutateDirection == mutationDirectionIn || cfg.MutateDirection == "both") {
+		inboundFactory = func(key session.Key) (packetHandle, error) {
 			return newBlockHandle(key)
 		}
 	}
-	return runHostMatchLoopWithHandles(ctx, cfg, logger, outObserveHandle, inObserveHandle, factory)
+	return runHostMatchLoopWithStaticHandles(ctx, cfg, logger, outObserveHandle, inObserveHandle, dnsObserveHandle, outBlockHandle, inBlockHandle, outboundFactory, inboundFactory)
 }
 
 func runHostMatchLoopWithHandles(
 	ctx context.Context,
 	cfg config.Config,
 	logger *slog.Logger,
-	outObserveHandle, inObserveHandle packetHandle,
+	outObserveHandle, inObserveHandle, dnsObserveHandle packetHandle,
 	newBlockHandle blockerFactory,
+) error {
+	switch cfg.MutateDirection {
+	case mutationDirectionIn:
+		return runHostMatchLoopWithStaticHandles(ctx, cfg, logger, outObserveHandle, inObserveHandle, dnsObserveHandle, nil, nil, nil, newBlockHandle)
+	case "both":
+		return runHostMatchLoopWithStaticHandles(ctx, cfg, logger, outObserveHandle, inObserveHandle, dnsObserveHandle, nil, nil, newBlockHandle, newBlockHandle)
+	default:
+		return runHostMatchLoopWithStaticHandles(ctx, cfg, logger, outObserveHandle, inObserveHandle, dnsObserveHandle, nil, nil, newBlockHandle, nil)
+	}
+}
+
+func runHostMatchLoopWithStaticHandles(
+	ctx context.Context,
+	cfg config.Config,
+	logger *slog.Logger,
+	outObserveHandle, inObserveHandle, dnsObserveHandle, outBlockHandle, inBlockHandle packetHandle,
+	newOutboundBlockHandle, newInboundBlockHandle blockerFactory,
 ) error {
 	logger = ensureLogger(logger)
 
@@ -166,14 +259,18 @@ func runHostMatchLoopWithHandles(
 	defer cancel()
 
 	store := session.NewStore(time.Now)
+	dnsCache := dnscache.New(cfg.TargetHost, time.Now)
 	reported := make(map[session.Key]struct{})
 	events := make(chan recvEvent, 8)
 	deadlines := make(map[session.Key]time.Time)
+	timeoutGraceArmed := make(map[session.Key]bool)
 	halfCloseDeadlines := make(map[session.Key]time.Time)
-	blockers := make(map[session.Key]packetHandle)
-	blockerKinds := make(map[session.Key]recvKind)
+	outboundBlockers := make(map[session.Key]packetHandle)
+	inboundBlockers := make(map[session.Key]packetHandle)
+	pendingOutboundBlockers := make(map[session.Key]struct{})
 	observeDirections := make(map[session.Key]string)
 	connectionStates := make(map[session.Key]hostOnlyConnectionState)
+	seenBlockEventKinds := make(map[string]struct{})
 
 	var (
 		wg        sync.WaitGroup
@@ -184,14 +281,30 @@ func runHostMatchLoopWithHandles(
 
 	closeHandles := func() {
 		closeOnce.Do(func() {
-			if outObserveHandle != nil {
+			if hasPacketHandle(outObserveHandle) {
 				_ = outObserveHandle.Close()
 			}
-			if inObserveHandle != nil {
+			if hasPacketHandle(inObserveHandle) {
 				_ = inObserveHandle.Close()
 			}
-			for _, handle := range blockers {
-				_ = handle.Close()
+			if hasPacketHandle(dnsObserveHandle) {
+				_ = dnsObserveHandle.Close()
+			}
+			if hasPacketHandle(outBlockHandle) {
+				_ = outBlockHandle.Close()
+			}
+			if hasPacketHandle(inBlockHandle) {
+				_ = inBlockHandle.Close()
+			}
+			for _, handle := range outboundBlockers {
+				if hasPacketHandle(handle) {
+					_ = handle.Close()
+				}
+			}
+			for _, handle := range inboundBlockers {
+				if hasPacketHandle(handle) {
+					_ = handle.Close()
+				}
 			}
 		})
 	}
@@ -257,13 +370,22 @@ func runHostMatchLoopWithHandles(
 		state := connectionStates[key]
 		return state.clientFINSeen != state.serverFINSeen
 	}
-	closeDynamicBlocker := func(key session.Key) {
-		handle, ok := blockers[key]
+	hasOutboundBlocker := func(key session.Key) bool { _, ok := outboundBlockers[key]; return ok }
+	hasInboundBlocker := func(key session.Key) bool { _, ok := inboundBlockers[key]; return ok }
+	closeOutboundBlocker := func(key session.Key) {
+		handle, ok := outboundBlockers[key]
 		if !ok {
 			return
 		}
-		delete(blockers, key)
-		delete(blockerKinds, key)
+		delete(outboundBlockers, key)
+		_ = handle.Close()
+	}
+	closeInboundBlocker := func(key session.Key) {
+		handle, ok := inboundBlockers[key]
+		if !ok {
+			return
+		}
+		delete(inboundBlockers, key)
 		_ = handle.Close()
 	}
 	resetObservationCycle := func(key session.Key) {
@@ -288,20 +410,32 @@ func runHostMatchLoopWithHandles(
 	}
 	startObservationCycle := func(key session.Key, direction string) {
 		delete(halfCloseDeadlines, key)
+		delete(timeoutGraceArmed, key)
 		observeDirections[key] = direction
 		deadlines[key] = time.Now().Add(cfg.ObserveTimeout)
 		resetTimer()
 	}
 	cleanupConnection := func(key session.Key) {
 		resetObservationCycle(key)
+		delete(timeoutGraceArmed, key)
 		delete(halfCloseDeadlines, key)
-		closeDynamicBlocker(key)
+		closeOutboundBlocker(key)
+		closeInboundBlocker(key)
+		delete(pendingOutboundBlockers, key)
 		delete(connectionStates, key)
 		store.Forget(key)
 	}
 	applyEventResult := func(result hostOnlyEventResult) {
 		if result.key == (session.Key{}) {
 			return
+		}
+		if result.observed {
+			result.resultDirection = directionFor(result.key)
+			if result.result.Outcome == session.OutcomeUnknown {
+				delete(timeoutGraceArmed, result.key)
+				deadlines[result.key] = time.Now().Add(cfg.ObserveTimeout)
+				resetTimer()
+			}
 		}
 		if result.observed && hasKnownOutcome(result.result) {
 			logResultOnce(logger, reported, store, result.key, result.result, signalReason(result.signal), result.resultDirection)
@@ -333,7 +467,7 @@ func runHostMatchLoopWithHandles(
 		return err
 	}
 	startReader := func(handle packetHandle, kind recvKind, key session.Key) {
-		if handle == nil {
+		if !hasPacketHandle(handle) {
 			return
 		}
 
@@ -355,16 +489,27 @@ func runHostMatchLoopWithHandles(
 	}
 	observeCfg := cfg
 	observeCfg.MutateDirection = "out"
-	blockKind := hostMatchBlockRecvKind(cfg)
 
 	readers := 0
-	if outObserveHandle != nil {
+	if hasPacketHandle(outObserveHandle) {
 		readers++
 		startReader(outObserveHandle, recvKindOutboundObserve, session.Key{})
 	}
-	if inObserveHandle != nil {
+	if hasPacketHandle(inObserveHandle) {
 		readers++
 		startReader(inObserveHandle, recvKindInboundObserve, session.Key{})
+	}
+	if hasPacketHandle(dnsObserveHandle) && usesDNS(cfg) {
+		readers++
+		startReader(dnsObserveHandle, recvKindDNSObserve, session.Key{})
+	}
+	if hasPacketHandle(outBlockHandle) {
+		readers++
+		startReader(outBlockHandle, recvKindOutboundBlock, session.Key{})
+	}
+	if hasPacketHandle(inBlockHandle) {
+		readers++
+		startReader(inBlockHandle, recvKindInboundBlock, session.Key{})
 	}
 
 	for readers > 0 || len(deadlines) > 0 || len(halfCloseDeadlines) > 0 {
@@ -377,9 +522,15 @@ func runHostMatchLoopWithHandles(
 				if deadline.After(now) {
 					continue
 				}
+				if directionFor(key) == mutationDirectionIn && hasInboundBlocker(key) && !timeoutGraceArmed[key] {
+					timeoutGraceArmed[key] = true
+					deadlines[key] = now.Add(cfg.ObserveTimeout)
+					continue
+				}
 				result := store.Observe(key, session.Signal{})
 				logResultOnce(logger, reported, store, key, result, "timeout", directionFor(key))
 				if hasKnownOutcome(result) {
+					delete(timeoutGraceArmed, key)
 					if isHalfClosed(key) {
 						retainHalfClosedConnection(key)
 					} else {
@@ -406,48 +557,100 @@ func runHostMatchLoopWithHandles(
 					readers--
 					continue
 				}
-				if isDynamicHostBlockKind(event.kind) {
-					if _, exists := blockers[event.key]; !exists {
-						logger.Debug(
-							"忽略已关闭动态阻断句柄返回的预期读错误",
-							"client_ip", event.key.ClientIP,
-							"client_port", event.key.ClientPort,
-							"server_ip", event.key.ServerIP,
-							"server_port", event.key.ServerPort,
-							"error", event.err,
-						)
-						readers--
-						continue
-					}
+				if event.kind == recvKindOutboundBlock && event.key != (session.Key{}) && !hasOutboundBlocker(event.key) {
+					logger.Debug(
+						"忽略已关闭动态出站阻断句柄返回的预期读错误",
+						"client_ip", event.key.ClientIP,
+						"client_port", event.key.ClientPort,
+						"server_ip", event.key.ServerIP,
+						"server_port", event.key.ServerPort,
+						"error", event.err,
+					)
+					readers--
+					continue
+				}
+				if event.kind == recvKindInboundBlock && event.key != (session.Key{}) && !hasInboundBlocker(event.key) {
+					logger.Debug(
+						"忽略已关闭动态入站阻断句柄返回的预期读错误",
+						"client_ip", event.key.ClientIP,
+						"client_port", event.key.ClientPort,
+						"server_ip", event.key.ServerIP,
+						"server_port", event.key.ServerPort,
+						"error", event.err,
+					)
+					readers--
+					continue
 				}
 				return shutdown(event.err)
 			}
 
 			switch event.kind {
+			case recvKindDNSObserve:
+				processDNSObserve(cfg, logger, dnsCache, event.packet)
 			case recvKindOutboundObserve:
-				result, err := processHostOnlyObservedOutbound(cfg, logger, store, event.packet)
+				meta, err := tcpmeta.ParseIPv4TCP(event.packet)
+				if err == nil && matchesOutbound(cfg, meta) {
+					key := outboundKey(meta)
+					if hasOutboundBlocker(key) {
+						continue
+					}
+				}
+
+				result, err := processHostOnlyObservedOutbound(cfg, logger, store, dnsCache, event.packet)
 				if err != nil {
 					return shutdown(err)
 				}
 				touchHalfClose(result.key)
 				applyEventResult(result)
-				if result.matched && newBlockHandle != nil {
-					if _, exists := blockers[result.key]; !exists {
-						handle, err := newBlockHandle(result.key)
-						if err != nil {
-							return shutdown(err)
+				if result.matched && result.canBlockOut && newOutboundBlockHandle != nil && !hasOutboundBlocker(result.key) {
+					if result.deferBlockOut {
+						if _, armed := pendingOutboundBlockers[result.key]; !armed {
+							pendingOutboundBlockers[result.key] = struct{}{}
+							continue
 						}
-						blockers[result.key] = handle
-						blockerKinds[result.key] = blockKind
-						readers++
-						startReader(handle, blockKind, result.key)
 					}
+
+					handle, err := newOutboundBlockHandle(result.key)
+					if err != nil {
+						return shutdown(err)
+					}
+					outboundBlockers[result.key] = handle
+					delete(pendingOutboundBlockers, result.key)
+					logger.Info(
+						"已创建动态阻断句柄",
+						"trace_id", store.TraceID(result.key),
+						"client_ip", result.key.ClientIP,
+						"client_port", result.key.ClientPort,
+						"server_ip", result.key.ServerIP,
+						"server_port", result.key.ServerPort,
+						"block_kind", recvKindOutboundBlock,
+					)
+					readers++
+					startReader(handle, recvKindOutboundBlock, result.key)
+				}
+				if result.matched && result.canBlockIn && newInboundBlockHandle != nil && !hasInboundBlocker(result.key) {
+					handle, err := newInboundBlockHandle(result.key)
+					if err != nil {
+						return shutdown(err)
+					}
+					inboundBlockers[result.key] = handle
+					logger.Info(
+						"已创建动态阻断句柄",
+						"trace_id", store.TraceID(result.key),
+						"client_ip", result.key.ClientIP,
+						"client_port", result.key.ClientPort,
+						"server_ip", result.key.ServerIP,
+						"server_port", result.key.ServerPort,
+						"block_kind", recvKindInboundBlock,
+					)
+					readers++
+					startReader(handle, recvKindInboundBlock, result.key)
 				}
 			case recvKindInboundObserve:
 				meta, err := tcpmeta.ParseIPv4TCP(event.packet)
 				if err == nil && matchesInbound(cfg, meta) {
 					key := inboundKey(meta)
-					if kind, ok := blockerKinds[key]; ok && (kind == recvKindInboundBlock || kind == recvKindBidirectionalBlock) {
+					if hasInboundBlocker(key) {
 						continue
 					}
 				}
@@ -464,8 +667,36 @@ func runHostMatchLoopWithHandles(
 				touchHalfClose(result.key)
 				applyEventResult(result)
 			case recvKindOutboundBlock:
-				resultDirection := directionFor(event.key)
-				result, err := processHostOnlyBlockedOutbound(cfg, logger, store, event.key, event.packet, event.addr, blockers[event.key], resultDirection)
+				blockEventID := fmt.Sprintf("out|%s|%d|%s|%d", event.key.ClientIP, event.key.ClientPort, event.key.ServerIP, event.key.ServerPort)
+				if _, ok := seenBlockEventKinds[blockEventID]; !ok {
+					seenBlockEventKinds[blockEventID] = struct{}{}
+					payloadLen := 0
+					tcpFlags := uint8(0)
+					payloadPrefix := ""
+					if meta, err := tcpmeta.ParseIPv4TCP(event.packet); err == nil {
+						payloadLen = len(meta.Payload)
+						tcpFlags = meta.TCPFlags
+						payloadPrefix = fmt.Sprintf("% x", prefixBytes(meta.Payload, 8))
+					}
+					logger.Info(
+						"阻断句柄收到出站数据包",
+						"client_ip", event.key.ClientIP,
+						"client_port", event.key.ClientPort,
+						"server_ip", event.key.ServerIP,
+						"server_port", event.key.ServerPort,
+						"tcp_flags", fmt.Sprintf("0x%02x", tcpFlags),
+						"payload_len", payloadLen,
+						"payload_prefix", payloadPrefix,
+					)
+				}
+				handle := eventSender(event.key, outBlockHandle, outboundBlockers)
+				meta, metaErr := tcpmeta.ParseIPv4TCP(event.packet)
+				outboundKeyForDirection := event.key
+				if outboundKeyForDirection == (session.Key{}) && metaErr == nil && matchesOutbound(cfg, meta) {
+					outboundKeyForDirection = outboundKey(meta)
+				}
+				resultDirection := directionFor(outboundKeyForDirection)
+				result, err := processHostOnlyBlockedOutbound(cfg, logger, store, event.key, event.packet, event.addr, handle, resultDirection)
 				if err != nil {
 					return shutdown(err)
 				}
@@ -474,9 +705,58 @@ func runHostMatchLoopWithHandles(
 					startObservationCycle(result.key, mutationDirectionOut)
 				}
 				applyEventResult(result)
+				if newInboundBlockHandle != nil && !hasInboundBlocker(result.key) {
+					if metaErr == nil && shouldArmInboundBlocker(cfg, meta.Payload) {
+						handle, err := newInboundBlockHandle(result.key)
+						if err != nil {
+							return shutdown(err)
+						}
+						inboundBlockers[result.key] = handle
+						logger.Info(
+							"已创建动态阻断句柄",
+							"trace_id", store.TraceID(result.key),
+							"client_ip", result.key.ClientIP,
+							"client_port", result.key.ClientPort,
+							"server_ip", result.key.ServerIP,
+							"server_port", result.key.ServerPort,
+							"block_kind", recvKindInboundBlock,
+						)
+						readers++
+						startReader(handle, recvKindInboundBlock, result.key)
+					}
+				}
 			case recvKindInboundBlock:
-				resultDirection := directionFor(event.key)
-				result, err := processHostOnlyInbound(logger, store, cfg, event.packet, event.addr, blockers[event.key], resultDirection)
+				blockEventID := fmt.Sprintf("in|%s|%d|%s|%d", event.key.ClientIP, event.key.ClientPort, event.key.ServerIP, event.key.ServerPort)
+				if _, ok := seenBlockEventKinds[blockEventID]; !ok {
+					seenBlockEventKinds[blockEventID] = struct{}{}
+					payloadLen := 0
+					tcpFlags := uint8(0)
+					payloadPrefix := ""
+					if meta, err := tcpmeta.ParseIPv4TCP(event.packet); err == nil {
+						payloadLen = len(meta.Payload)
+						tcpFlags = meta.TCPFlags
+						payloadPrefix = fmt.Sprintf("% x", prefixBytes(meta.Payload, 8))
+					}
+					logger.Info(
+						"阻断句柄收到入站数据包",
+						"client_ip", event.key.ClientIP,
+						"client_port", event.key.ClientPort,
+						"server_ip", event.key.ServerIP,
+						"server_port", event.key.ServerPort,
+						"tcp_flags", fmt.Sprintf("0x%02x", tcpFlags),
+						"payload_len", payloadLen,
+						"payload_prefix", payloadPrefix,
+					)
+				}
+				handle := eventSender(event.key, inBlockHandle, inboundBlockers)
+				inboundKeyForDirection := event.key
+				if inboundKeyForDirection == (session.Key{}) {
+					if meta, err := tcpmeta.ParseIPv4TCP(event.packet); err == nil && matchesInbound(cfg, meta) {
+						inboundKeyForDirection = inboundKey(meta)
+					}
+				}
+				resultDirection := directionFor(inboundKeyForDirection)
+				result, err := processHostOnlyInbound(logger, store, cfg, event.packet, event.addr, handle, resultDirection)
 				if err != nil {
 					return shutdown(err)
 				}
@@ -485,48 +765,6 @@ func runHostMatchLoopWithHandles(
 					startObservationCycle(result.key, mutationDirectionIn)
 				}
 				applyEventResult(result)
-			case recvKindBidirectionalBlock:
-				handle := blockers[event.key]
-				if handle == nil {
-					continue
-				}
-
-				meta, err := tcpmeta.ParseIPv4TCP(event.packet)
-				if err != nil {
-					if sendErr := handle.Send(event.packet, event.addr); sendErr != nil {
-						return shutdown(sendErr)
-					}
-					continue
-				}
-
-				switch {
-				case matchesOutbound(cfg, meta):
-					resultDirection := directionFor(event.key)
-					result, err := processHostOnlyBlockedOutbound(cfg, logger, store, event.key, event.packet, event.addr, handle, resultDirection)
-					if err != nil {
-						return shutdown(err)
-					}
-					touchHalfClose(result.key)
-					if result.mutated {
-						startObservationCycle(result.key, mutationDirectionOut)
-					}
-					applyEventResult(result)
-				case matchesInbound(cfg, meta):
-					resultDirection := directionFor(event.key)
-					result, err := processHostOnlyInbound(logger, store, cfg, event.packet, event.addr, handle, resultDirection)
-					if err != nil {
-						return shutdown(err)
-					}
-					touchHalfClose(result.key)
-					if result.mutated {
-						startObservationCycle(result.key, mutationDirectionIn)
-					}
-					applyEventResult(result)
-				default:
-					if err := handle.Send(event.packet, event.addr); err != nil {
-						return shutdown(err)
-					}
-				}
 			}
 		}
 	}
@@ -538,6 +776,7 @@ func processHostOnlyObservedOutbound(
 	cfg config.Config,
 	logger *slog.Logger,
 	store *session.Store,
+	dnsCache *dnscache.Cache,
 	packet []byte,
 ) (hostOnlyEventResult, error) {
 	meta, err := tcpmeta.ParseIPv4TCP(packet)
@@ -558,22 +797,62 @@ func processHostOnlyObservedOutbound(
 		resultDirection: mutationDirectionOut,
 	}
 
-	if shouldResolveHost(cfg, store, key) {
+	if usesDNS(cfg) {
+		if entry, ok := dnsCache.Lookup(meta.DstIP); ok {
+			state := store.MatchState(key)
+			if state != session.MatchStateExcluded {
+				store.MarkMatched(key)
+				result.matched = true
+				result.canBlockOut = mutatesOutbound(cfg) && len(meta.Payload) > 0
+				result.deferBlockOut = shouldDeferHostBlock(cfg, state, meta.Payload)
+				result.canBlockIn = shouldArmInboundBlocker(cfg, meta.Payload)
+				if state != session.MatchStateMatched {
+					logger.Info(
+						"DNS 命中目标连接",
+						"trace_id", store.TraceID(key),
+						"client_ip", key.ClientIP,
+						"client_port", key.ClientPort,
+						"server_ip", key.ServerIP,
+						"server_port", key.ServerPort,
+						"target_host", cfg.TargetHost,
+						"matched_ip", entry.IP.String(),
+						"match_source", "dns",
+					)
+				}
+			}
+		}
+	}
+
+	if usesSNI(cfg) && store.MatchState(key) != session.MatchStateExcluded {
 		if serverName, ok := tlshello.ParseServerName(meta.Payload); ok {
+			state := store.MatchState(key)
 			if hostMatches(cfg, serverName) {
 				store.MarkMatched(key)
 				result.matched = true
+				result.canBlockOut = mutatesOutbound(cfg) && len(meta.Payload) > 0
+				result.canBlockIn = shouldArmInboundBlocker(cfg, meta.Payload)
+				if state != session.MatchStateMatched {
+					logger.Info(
+						"SNI 命中目标域名",
+						"trace_id", store.TraceID(key),
+						"client_ip", key.ClientIP,
+						"client_port", key.ClientPort,
+						"server_ip", key.ServerIP,
+						"server_port", key.ServerPort,
+						"target_host", cfg.TargetHost,
+						"matched_host", serverName,
+					)
+				}
+			} else if store.MatchState(key) == session.MatchStateMatched {
 				logger.Info(
-					"SNI 命中目标域名",
+					"DNS 命中目标连接但 SNI 不同",
 					"trace_id", store.TraceID(key),
-					"client_ip", key.ClientIP,
-					"client_port", key.ClientPort,
-					"server_ip", key.ServerIP,
-					"server_port", key.ServerPort,
 					"target_host", cfg.TargetHost,
-					"matched_host", serverName,
+					"observed_host", serverName,
+					"matched_ip", key.ServerIP,
 				)
-			} else {
+				return result, nil
+			} else if shouldResolveHost(cfg, store, key) {
 				store.MarkExcluded(key)
 				logger.Info(
 					"SNI 未命中目标域名",
@@ -589,7 +868,47 @@ func processHostOnlyObservedOutbound(
 		}
 	}
 
+	if store.MatchState(key) == session.MatchStateMatched {
+		result.matched = true
+		if mutatesOutbound(cfg) && len(meta.Payload) > 0 {
+			result.canBlockOut = true
+		}
+		if shouldArmInboundBlocker(cfg, meta.Payload) {
+			result.canBlockIn = true
+		}
+	}
+
+	if store.HasMutation(key) {
+		result.result = store.Observe(key, result.signal)
+		result.observed = true
+	}
+
 	return result, nil
+}
+
+func processDNSObserve(cfg config.Config, logger *slog.Logger, cache *dnscache.Cache, packet []byte) {
+	if !usesDNS(cfg) || cache == nil {
+		return
+	}
+
+	answers, err := dnsmeta.ParseIPv4UDPResponse(packet)
+	if err != nil {
+		logger.Debug("跳过无法解析的 DNS 响应", "error", err)
+		return
+	}
+	for _, answer := range answers {
+		entry, ok := cache.Store(answer.Name, answer.IP, answer.TTL)
+		if !ok {
+			continue
+		}
+		logger.Info(
+			"DNS 命中目标域名",
+			"target_host", cfg.TargetHost,
+			"resolved_ip", entry.IP.String(),
+			"dns_ttl", answer.TTL.String(),
+			"effective_ttl", entry.TTL.String(),
+		)
+	}
 }
 
 func processHostOnlyBlockedOutbound(
@@ -676,6 +995,10 @@ func processHostOnlyBlockedOutbound(
 	}
 
 	if !isConnectionMatched(cfg, store, key) {
+		return result, handle.Send(packet, addr)
+	}
+
+	if len(meta.Payload) == 0 && !isTerminalSignal(result.signal) {
 		return result, handle.Send(packet, addr)
 	}
 
@@ -791,7 +1114,7 @@ func processHostOnlyBlockedOutbound(
 	if err := handle.Send(packet, addr); err != nil {
 		return hostOnlyEventResult{}, err
 	}
-	if isTerminalSignal(result.signal) && store.HasMutation(key) {
+	if store.HasMutation(key) {
 		result.result = store.Observe(key, result.signal)
 		result.observed = true
 	}
@@ -833,6 +1156,15 @@ func processHostOnlyInbound(
 		return result, nil
 	}
 
+	if len(meta.Payload) == 0 && !isTerminalSignal(result.signal) {
+		if handle != nil {
+			if err := handle.Send(packet, addr); err != nil {
+				return hostOnlyEventResult{}, err
+			}
+		}
+		return result, nil
+	}
+
 	if !mutatesInbound(cfg) {
 		if handle != nil {
 			if err := handle.Send(packet, addr); err != nil {
@@ -850,6 +1182,7 @@ func processHostOnlyInbound(
 
 	originalPayload := append([]byte(nil), meta.Payload...)
 	var firstAppliedMutation *mutate.AppliedMutation
+	retransmittedMutation := false
 	recordMutation := func(applied mutate.AppliedMutation) {
 		if firstAppliedMutation == nil {
 			appliedCopy := applied
@@ -952,6 +1285,9 @@ func processHostOnlyInbound(
 	if err := refreshObservationWindow(); err != nil {
 		return hostOnlyEventResult{}, err
 	}
+	if result.mutated && firstAppliedMutation != nil {
+		retransmittedMutation = store.NoteInboundMutationHit(key, meta.Seq, firstAppliedMutation.TargetSeq)
+	}
 
 	if handle != nil {
 		if err := handle.Send(packet, addr); err != nil {
@@ -966,24 +1302,45 @@ func processHostOnlyInbound(
 	if result.mutated {
 		result.resultDirection = mutationDirectionIn
 	}
+	if retransmittedMutation {
+		result.signal.Retransmit = true
+		result.result = store.Observe(key, result.signal)
+		result.observed = true
+		return result, nil
+	}
 	result.result = store.Observe(key, result.signal)
 	result.observed = true
 	return result, nil
 }
 
-func hostMatchBlockRecvKind(cfg config.Config) recvKind {
-	switch cfg.MutateDirection {
-	case "in":
-		return recvKindInboundBlock
-	case "both":
-		return recvKindBidirectionalBlock
-	default:
-		return recvKindOutboundBlock
-	}
+func shouldDeferHostBlock(cfg config.Config, state session.MatchState, payload []byte) bool {
+	return cfg.MutateDirection == mutationDirectionOut &&
+		state == session.MatchStateMatched &&
+		payloadStartsHandshake(payload)
 }
 
-func isDynamicHostBlockKind(kind recvKind) bool {
-	return kind == recvKindOutboundBlock || kind == recvKindInboundBlock || kind == recvKindBidirectionalBlock
+func shouldArmInboundBlocker(cfg config.Config, payload []byte) bool {
+	if cfg.MutateDirection != mutationDirectionIn && cfg.MutateDirection != "both" {
+		return false
+	}
+	return payloadStartsApplicationData(payload)
+}
+
+func initialObservationDirection(cfg config.Config) string {
+	if cfg.MutateDirection == mutationDirectionIn {
+		return mutationDirectionIn
+	}
+	return mutationDirectionOut
+}
+
+func prefixBytes(data []byte, n int) []byte {
+	if n <= 0 || len(data) == 0 {
+		return nil
+	}
+	if len(data) < n {
+		n = len(data)
+	}
+	return data[:n]
 }
 
 func openHandle(filter string, priority int16, flags uint64) (*Handle, error) {
