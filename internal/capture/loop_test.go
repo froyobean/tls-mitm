@@ -489,7 +489,7 @@ func TestHostMatchDNSModeDefersBlockerUntilSecondPayloadAfterACKMatch(t *testing
 	}
 }
 
-func TestHostMatchBothModeDoesNotDeferBlockAfterDNSThenSNI(t *testing.T) {
+func TestHostMatchBothModeLogsDNSAndSNIVerificationAfterDNSThenSNI(t *testing.T) {
 	cfg := config.Config{
 		TargetHost:      "www.example.com",
 		TargetPort:      443,
@@ -499,7 +499,8 @@ func TestHostMatchBothModeDoesNotDeferBlockAfterDNSThenSNI(t *testing.T) {
 		HostMatch:       "both",
 	}
 
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
 	store := session.NewStore(time.Now)
 	dnsCache := dnscache.New(cfg.TargetHost, time.Now)
 	processDNSObserve(cfg, logger, dnsCache, dnsResponsePacketForCaptureTest("www.example.com", "93.184.216.34", 300))
@@ -516,6 +517,19 @@ func TestHostMatchBothModeDoesNotDeferBlockAfterDNSThenSNI(t *testing.T) {
 	}
 	if result.canBlockIn {
 		t.Fatalf("expected both-mode DNS+SNI packet not to arm inbound blocker before outbound application data, got %+v", result)
+	}
+	logOutput := logs.String()
+	if got := strings.Count(logOutput, "msg=\"DNS 命中目标连接\""); got != 1 {
+		t.Fatalf("expected exactly one DNS match log, got %d logs: %s", got, logOutput)
+	}
+	for _, want := range []string{
+		"msg=\"SNI 复核命中目标域名\"",
+		"target_host=www.example.com",
+		"matched_host=www.example.com",
+	} {
+		if !strings.Contains(logOutput, want) {
+			t.Fatalf("expected DNS-then-SNI verification log to include %q, got: %s", want, logOutput)
+		}
 	}
 }
 

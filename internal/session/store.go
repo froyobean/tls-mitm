@@ -75,6 +75,8 @@ type entry struct {
 	observeUntil time.Time
 	byteIndex    int
 	matchState   MatchState
+	firstMatchBy string
+	sniVerified  bool
 	hasMutation  bool
 	lastObserved time.Time
 	done         bool
@@ -274,7 +276,49 @@ func (s *Store) MarkMatched(key Key) {
 	defer s.mu.Unlock()
 
 	e := s.ensureEntryLocked(key)
-	e.matchState = MatchStateMatched
+	if e.matchState != MatchStateMatched {
+		e.matchState = MatchStateMatched
+	}
+}
+
+// MarkMatchedBy 将连接标记为已命中目标，并在首次命中时记录来源。
+func (s *Store) MarkMatchedBy(key Key, source string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e := s.ensureEntryLocked(key)
+	if e.matchState != MatchStateMatched {
+		e.matchState = MatchStateMatched
+		if e.firstMatchBy == "" {
+			e.firstMatchBy = source
+		}
+	}
+}
+
+// FirstMatchSource 返回连接首次命中来源，未知时返回空字符串。
+func (s *Store) FirstMatchSource(key Key) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.data[key]
+	if !ok {
+		return ""
+	}
+	return e.firstMatchBy
+}
+
+// MarkSNIVerified 将连接标记为已记录过 SNI 复核日志。
+// 返回 true 表示本次首次标记，false 表示此前已标记。
+func (s *Store) MarkSNIVerified(key Key) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e := s.ensureEntryLocked(key)
+	if e.sniVerified {
+		return false
+	}
+	e.sniVerified = true
+	return true
 }
 
 // MarkExcluded 将连接标记为已排除目标。

@@ -801,7 +801,7 @@ func processHostOnlyObservedOutbound(
 		if entry, ok := dnsCache.Lookup(meta.DstIP); ok {
 			state := store.MatchState(key)
 			if state != session.MatchStateExcluded {
-				store.MarkMatched(key)
+				store.MarkMatchedBy(key, "dns")
 				result.matched = true
 				result.canBlockOut = mutatesOutbound(cfg) && len(meta.Payload) > 0
 				result.deferBlockOut = shouldDeferHostBlock(cfg, state, meta.Payload)
@@ -827,11 +827,24 @@ func processHostOnlyObservedOutbound(
 		if serverName, ok := tlshello.ParseServerName(meta.Payload); ok {
 			state := store.MatchState(key)
 			if hostMatches(cfg, serverName) {
-				store.MarkMatched(key)
+				store.MarkMatchedBy(key, "sni")
 				result.matched = true
 				result.canBlockOut = mutatesOutbound(cfg) && len(meta.Payload) > 0
 				result.canBlockIn = shouldArmInboundBlocker(cfg, meta.Payload)
-				if state != session.MatchStateMatched {
+				if state == session.MatchStateMatched && store.FirstMatchSource(key) == "dns" {
+					if store.MarkSNIVerified(key) {
+						logger.Info(
+							"SNI 复核命中目标域名",
+							"trace_id", store.TraceID(key),
+							"client_ip", key.ClientIP,
+							"client_port", key.ClientPort,
+							"server_ip", key.ServerIP,
+							"server_port", key.ServerPort,
+							"target_host", cfg.TargetHost,
+							"matched_host", serverName,
+						)
+					}
+				} else if state != session.MatchStateMatched {
 					logger.Info(
 						"SNI 命中目标域名",
 						"trace_id", store.TraceID(key),
